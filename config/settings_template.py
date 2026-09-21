@@ -1,0 +1,8 @@
+import os
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "MATIN0893")
+RENDER_DEPLOY_HOOK = os.environ.get("RENDER_DEPLOY_HOOK")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ALLOWED_USERS = [5079072619]
