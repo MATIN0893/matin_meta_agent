@@ -21,22 +21,37 @@ from services.deploy_service import trigger_deploy
 MAX_FIX_ATTEMPTS = 3
 
 def extract_json(text: str) -> dict:
+    # 1. Убираем markdown-теги ```json и ```
     clean = re.sub(r"```(?:json)?", "", text).strip()
+    
+    # 2. Вырезаем только тело JSON от первой { до последней }
     start = clean.find("{")
     end = clean.rfind("}")
     if start != -1 and end != -1:
         clean = clean[start : end + 1]
-    
+
+    # 3. Нормализуем пробелы и переносы строк вокруг ключей
+    clean = re.sub(r'[\r\n]+\s*"', '"', clean)
+    clean = re.sub(r",\s*([\]}])", r"\1", clean)
+
     try:
         data = json.loads(clean)
-    except json.JSONDecodeError:
-        # Убираем trailing commas перед закрывающими скобками
-        clean_fixed = re.sub(r",\s*([\]}])", r"\1", clean)
-        data = json.loads(clean_fixed)
-        
+    except Exception:
+        # Резервный разбор через строгий regex если стандартный json упал
+        import ast
+        try:
+            data = ast.literal_eval(clean)
+        except Exception:
+            raise json.JSONDecodeError("Не удалось распарсить JSON", clean, 0)
+
     if isinstance(data, dict):
-        # Очищаем ключи от лишних пробелов и переводов строк
-        return {k.strip(): v for k, v in data.items()}
+        # Очищаем все ключи от лишних пробелов, кавычек и спецсимволов
+        cleaned_dict = {}
+        for k, v in data.items():
+            key_clean = str(k).strip().strip('"').strip("'").strip()
+            cleaned_dict[key_clean] = v
+        return cleaned_dict
+
     return data
 
 async def run_task(user_prompt: str, progress_cb=None) -> str:
