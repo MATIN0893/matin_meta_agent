@@ -20,39 +20,39 @@ from services.deploy_service import trigger_deploy
 
 MAX_FIX_ATTEMPTS = 3
 
+def clean_key(k: str) -> str:
+    """Удаляет пробелы, переносы строк и любые кавычки из имени ключа."""
+    return str(k).replace('"', '').replace("'", '').strip()
+
+def normalize_dict(obj):
+    """Рекурсивно очищает все ключи словаря от невидимого мусора."""
+    if isinstance(obj, dict):
+        return {clean_key(k): normalize_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [normalize_dict(elem) for elem in obj]
+    return obj
+
 def extract_json(text: str) -> dict:
-    # 1. Убираем markdown-теги ```json и ```
     clean = re.sub(r"```(?:json)?", "", text).strip()
     
-    # 2. Вырезаем только тело JSON от первой { до последней }
     start = clean.find("{")
     end = clean.rfind("}")
     if start != -1 and end != -1:
         clean = clean[start : end + 1]
 
-    # 3. Нормализуем пробелы и переносы строк вокруг ключей
-    clean = re.sub(r'[\r\n]+\s*"', '"', clean)
+    # Убираем запятые перед закрывающими скобками
     clean = re.sub(r",\s*([\]}])", r"\1", clean)
 
-    try:
-        data = json.loads(clean)
-    except Exception:
-        # Резервный разбор через строгий regex если стандартный json упал
-        import ast
-        try:
-            data = ast.literal_eval(clean)
-        except Exception:
-            raise json.JSONDecodeError("Не удалось распарсить JSON", clean, 0)
+    data = json.loads(clean)
+    return normalize_dict(data)
 
-    if isinstance(data, dict):
-        # Очищаем все ключи от лишних пробелов, кавычек и спецсимволов
-        cleaned_dict = {}
-        for k, v in data.items():
-            key_clean = str(k).strip().strip('"').strip("'").strip()
-            cleaned_dict[key_clean] = v
-        return cleaned_dict
-
-    return data
+def get_field(data: dict, target: str, default=None):
+    """Безопасный поиск поля независимо от регистра или пробелов."""
+    target_clean = clean_key(target).lower()
+    for k, v in data.items():
+        if clean_key(k).lower() == target_clean:
+            return v
+    return default
 
 async def run_task(user_prompt: str, progress_cb=None) -> str:
     try:
@@ -72,11 +72,11 @@ async def run_task(user_prompt: str, progress_cb=None) -> str:
         plan_raw = ask(planner_prompt, user_prompt)
         plan = extract_json(plan_raw)
 
-        action = plan.get("action", "create")
-        project_name = plan.get("project_name", "my_service")
-        task_desc = plan.get("task_description", user_prompt)
-        target_file_to_delete = plan.get("target_file_to_delete")
-        extracted_env = plan.get("extracted_env", {})
+        action = get_field(plan, "action", "create")
+        project_name = get_field(plan, "project_name", "my_service")
+        task_desc = get_field(plan, "task_description", user_prompt)
+        target_file_to_delete = get_field(plan, "target_file_to_delete", None)
+        extracted_env = get_field(plan, "extracted_env", {})
 
         # === СЦЕНАРИЙ 1: УДАЛЕНИЕ ===
         if action == "delete":
@@ -84,17 +84,17 @@ async def run_task(user_prompt: str, progress_cb=None) -> str:
                 if progress_cb:
                     await progress_cb(f"🗑 Удаляю файл {target_file_to_delete}...")
                 ok = delete_repo_file(project_name, target_file_to_delete)
-                return f"✅ Файл `{target_file_to_delete}` удален из `{project_name}`." if ok else f"❌ Не удалось удалить файл `{target_file_to_delete}`."
+                return f"✅ Файл <code>{target_file_to_delete}</code> удален из <code>{project_name}</code>." if ok else f"❌ Не удалось удалить файл <code>{target_file_to_delete}</code>."
             else:
                 if progress_cb:
                     await progress_cb(f"⚠️ Удаляю репозиторий {project_name}...")
                 ok = delete_repo(project_name)
-                return f"✅ Репозиторий `{project_name}` полностью удален с GitHub." if ok else f"❌ Ошибка удаления репозитория `{project_name}`."
+                return f"✅ Репозиторий <code>{project_name}</code> полностью удален с GitHub." if ok else f"❌ Ошибка удаления репозитория <code>{project_name}</code>."
 
         # === СЦЕНАРИЙ 2: МОДИФИКАЦИЯ СУЩЕСТВУЮЩЕГО РЕПОЗИТОРИЯ ===
         elif action == "modify" and project_name in repos:
             if progress_cb:
-                await progress_cb(f"📂 Скачиваю проект `{project_name}` с GitHub...")
+                await progress_cb(f"📂 Скачиваю проект <code>{project_name}</code> с GitHub...")
             current_files = get_repo_files(project_name)
 
             if progress_cb:
@@ -109,7 +109,7 @@ async def run_task(user_prompt: str, progress_cb=None) -> str:
 
             mod_raw = ask(MODIFIER_SYSTEM, context)
             mod_data = extract_json(mod_raw)
-            files_to_update = mod_data.get("files", {})
+            files_to_update = get_field(mod_data, "files", {})
 
             # Проверяем синтаксис
             for attempt in range(MAX_FIX_ATTEMPTS):
@@ -123,7 +123,7 @@ async def run_task(user_prompt: str, progress_cb=None) -> str:
                     files_to_update[fn] = fixed
 
             if progress_cb:
-                await progress_cb(f"📦 Пушу изменения в `{project_name}`...")
+                await progress_cb(f"📦 Пушу изменения в <code>{project_name}</code>...")
             repo_url = push_project(project_name, files_to_update)
 
             if progress_cb:
@@ -141,7 +141,7 @@ async def run_task(user_prompt: str, progress_cb=None) -> str:
         # === СЦЕНАРИЙ 3: СОЗДАНИЕ С НУЛЯ ===
         else:
             if progress_cb:
-                await progress_cb(f"🏗 Проектирую новую архитектуру для `{project_name}`...")
+                await progress_cb(f"🏗 Проектирую новую архитектуру для <code>{project_name}</code>...")
 
             prompt_for_eng = f"Задача: {task_desc}\nПроект: {project_name}\n"
             if extracted_env:
@@ -149,7 +149,7 @@ async def run_task(user_prompt: str, progress_cb=None) -> str:
 
             eng_raw = ask(ENGINEER_SYSTEM, prompt_for_eng)
             eng_data = extract_json(eng_raw)
-            files = eng_data.get("files", {})
+            files = get_field(eng_data, "files", {})
 
             # Исправление синтаксических ошибок
             for attempt in range(MAX_FIX_ATTEMPTS):
