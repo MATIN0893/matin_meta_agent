@@ -1,133 +1,131 @@
-import base64
-import requests
+import os
+from github import Github, GithubException
 from config.settings import GITHUB_TOKEN, GITHUB_USERNAME
 
-def _headers() -> dict:
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-    }
+IGNORE_DIRS = {
+    ".git", ".github", ".venv", "venv", "env", "__pycache__",
+    ".pytest_cache", ".idea", ".vscode", "node_modules", "dist", "build"
+}
 
-def list_user_repos(limit: int = 30) -> list:
-    url = f"https://api.github.com/user/repos?per_page={limit}&sort=updated"
-    resp = requests.get(url, headers=_headers(), timeout=15)
-    if resp.status_code == 200:
-        return [r["name"] for r in resp.json()]
-    return []
+IGNORE_EXTENSIONS = {
+    ".pyc", ".pyo", ".pyd", ".png", ".jpg", ".jpeg", ".gif",
+    ".ico", ".svg", ".webp", ".zip", ".tar", ".gz", ".exe",
+    ".dll", ".so", ".dylib", ".pdf", ".woff", ".woff2", ".ttf"
+}
 
-def get_repo_files(repo_name: str, branch: str = "master") -> dict:
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/git/trees/{branch}?recursive=1"
-    resp = requests.get(url, headers=_headers(), timeout=15)
-    if resp.status_code != 200:
-        # Fallback на main если master не существует
-        url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/git/trees/main?recursive=1"
-        resp = requests.get(url, headers=_headers(), timeout=15)
-        if resp.status_code != 200:
+MAX_FILE_SIZE_BYTES = 150 * 1024  # 150 KB
+
+def get_github_client() -> Github:
+    if not GITHUB_TOKEN:
+        raise ValueError("GITHUB_TOKEN не задан в переменных окружения.")
+    return Github(GITHUB_TOKEN)
+
+def list_user_repos() -> list:
+    gh = get_github_client()
+    try:
+        user = gh.get_user()
+        return [r.name for r in user.get_repos()]
+    except Exception as e:
+        print(f"[GitHub] Ошибка получения списка репозиториев: {e}")
+        return []
+
+def get_repo_files(repo_name: str) -> dict:
+    gh = get_github_client()
+    user = gh.get_user()
+    try:
+        repo = user.get_repo(repo_name)
+    except GithubException:
+        try:
+            repo = gh.get_repo(f"{GITHUB_USERNAME}/{repo_name}")
+        except Exception:
             return {}
 
-    tree = resp.json().get("tree", [])
-    files = {}
+    files_dict = {}
 
-    for item in tree:
-        if item["type"] == "blob":
-            path = item["path"]
-            # Пропускаем служебные бинарники и кэш
-            if path.startswith(".git") or "__pycache__" in path or path.endswith((".pyc", ".png", ".jpg")):
-                continue
-            f_resp = requests.get(item["url"], headers=_headers(), timeout=15)
-            if f_resp.status_code == 200:
-                raw_b64 = f_resp.json().get("content", "")
+    def fetch_recursive(path=""):
+        try:
+            contents = repo.get_contents(path)
+        except Exception:
+            return
+
+        if not isinstance(contents, list):
+            contents = [contents]
+
+        for item in contents:
+            # Пропускаем служебные директории
+            if item.type == "dir":
+                if item.name.lower() in IGNORE_DIRS:
+                    continue
+                fetch_recursive(item.path)
+            elif item.type == "file":
+                # Пропускаем бинарники и мусорные расширения
+                _, ext = os.path.splitext(item.name.lower())
+                if ext in IGNORE_EXTENSIONS:
+                    continue
+                # Пропускаем слишком большие файлы
+                if item.size > MAX_FILE_SIZE_BYTES:
+                    continue
                 try:
-                    files[path] = base64.b64decode(raw_b64).decode("utf-8")
+                    content_str = item.decoded_content.decode("utf-8", errors="ignore")
+                    files_dict[item.path] = content_str
                 except Exception:
                     pass
-    return files
 
-def push_project(repo_name: str, files: dict, branch: str = "master") -> str:
-    check_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}"
-    check = requests.get(check_url, headers=_headers(), timeout=15)
+    fetch_recursive()
+    return files_dict
 
-    if check.status_code == 404:
-        create_url = "https://api.github.com/user/repos"
-        requests.post(
-            create_url,
-            headers=_headers(),
-            json={"name": repo_name, "private": False, "auto_init": True},
-            timeout=15,
-        )
+def push_project(repo_name: str, files: dict, commit_message: str = "Production update by Matin Meta Agent") -> str:
+    gh = get_github_client()
+    user = gh.get_user()
 
-    for path, content in files.items():
-        file_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/{path}"
-        get_file = requests.get(file_url, headers=_headers(), timeout=15)
-        sha = get_file.json().get("sha") if get_file.status_code == 200 else None
+    try:
+        repo = user.get_repo(repo_name)
+    except GithubException:
+        repo = user.create_repo(repo_name, private=False)
 
-        b64_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-        payload = {
-            "message": f"DevOps OS: update {path}",
-            "content": b64_content,
-            "branch": branch,
-        }
-        if sha:
-            payload["sha"] = sha
+    for file_path, content in files.items():
+        if not content:
+            continue
+        try:
+            existing_file = repo.get_contents(file_path)
+            repo.update_file(
+                path=file_path,
+                message=commit_message,
+                content=content,
+                sha=existing_file.sha,
+            )
+        except GithubException:
+            repo.create_file(
+                path=file_path,
+                message=commit_message,
+                content=content,
+            )
 
-        requests.put(file_url, headers=_headers(), json=payload, timeout=15)
-
-    return f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
-
-def delete_repo_file(repo_name: str, file_path: str, branch: str = "master") -> bool:
-    file_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/contents/{file_path}"
-    get_file = requests.get(file_url, headers=_headers(), timeout=15)
-    if get_file.status_code != 200:
-        return False
-    sha = get_file.json().get("sha")
-    payload = {
-        "message": f"DevOps OS: remove {file_path}",
-        "sha": sha,
-        "branch": branch,
-    }
-    resp = requests.delete(file_url, headers=_headers(), json=payload, timeout=15)
-    return resp.status_code in (200, 204)
+    return repo.html_url
 
 def delete_repo(repo_name: str) -> bool:
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}"
-    resp = requests.delete(url, headers=_headers(), timeout=15)
-    return resp.status_code == 204
+    gh = get_github_client()
+    user = gh.get_user()
+    try:
+        repo = user.get_repo(repo_name)
+        repo.delete()
+        return True
+    except Exception as e:
+        print(f"[GitHub] Ошибка при удалении репозитория {repo_name}: {e}")
+        return False
 
-def list_branches(repo_name: str) -> list:
-    """Возвращает список всех веток проекта."""
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/branches"
-    resp = requests.get(url, headers=_headers(), timeout=15)
-    if resp.status_code == 200:
-        return [b["name"] for b in resp.json()]
-    return ["master"]
-
-def create_branch(repo_name: str, new_branch: str, base_branch: str = "master") -> bool:
-    """Создает новую ветку от базовой."""
-    ref_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/git/ref/heads/{base_branch}"
-    resp = requests.get(ref_url, headers=_headers(), timeout=15)
-    if resp.status_code != 200:
-        # Пробуем main если master нет
-        ref_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/git/ref/heads/main"
-        resp = requests.get(ref_url, headers=_headers(), timeout=15)
-        if resp.status_code != 200:
-            return False
-
-    sha = resp.json()["object"]["sha"]
-    create_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/git/refs"
-    payload = {"ref": f"refs/heads/{new_branch}", "sha": sha}
-    res = requests.post(create_url, headers=_headers(), json=payload, timeout=15)
-    return res.status_code == 201
-
-def create_pull_request(repo_name: str, title: str, head_branch: str, base_branch: str = "master") -> str:
-    """Создает Pull Request из head_branch в base_branch."""
-    url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo_name}/pulls"
-    payload = {
-        "title": title,
-        "head": head_branch,
-        "base": base_branch,
-        "body": "Автоматически сформированный PR от MATIN META AGENT OS"
-    }
-    resp = requests.post(url, headers=_headers(), json=payload, timeout=15)
-    if resp.status_code == 201:
-        return resp.json().get("html_url", "")
-    return ""
+def delete_repo_file(repo_name: str, file_path: str) -> bool:
+    gh = get_github_client()
+    user = gh.get_user()
+    try:
+        repo = user.get_repo(repo_name)
+        contents = repo.get_contents(file_path)
+        repo.delete_file(
+            path=file_path,
+            message=f"Delete {file_path} by Matin Meta Agent",
+            sha=contents.sha,
+        )
+        return True
+    except Exception as e:
+        print(f"[GitHub] Ошибка при удалении файла {file_path}: {e}")
+        return False
