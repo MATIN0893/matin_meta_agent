@@ -21,18 +21,18 @@ PLANNER_SYSTEM = GLOBAL_ENGINEERING_POLICY + """
 {repo_list}
 
 Формат ответа (ТОЛЬКО JSON):
-{
-  "action": "create" | "modify" | "delete",
+{{
+  "action": "create",
   "project_name": "snake_case_name",
   "target_file_to_delete": null,
   "task_description": "четкая техническая постановка задачи для инженеров",
-  "extracted_env": {
+  "extracted_env": {{
     "BOT_TOKEN": "значение если передано",
     "API_KEY": "значение если передано"
-  }
-}
+  }}
+}}
 
-Правила:
+Правила выбора action:
 - Если пользователь хочет удалить проект целиком: action="delete", project_name="имя", target_file_to_delete=null.
 - Если удалить конкретный файл: action="delete", project_name="имя", target_file_to_delete="путь/к/файлу".
 - Если пользователь упоминает существующий проект или его контекст: action="modify", project_name="имя_из_списка".
