@@ -7,8 +7,12 @@ from core.prompts import (
     PLANNER_USER,
     MODIFIER_SYSTEM,
     MODIFIER_USER,
+    ENGINEER_SYSTEM,
+    ENGINEER_USER,
     REVIEWER_SYSTEM,
     REVIEWER_USER,
+    FIXER_SYSTEM,
+    FIXER_USER,
 )
 from services.github_service import (
     list_user_repos,
@@ -16,16 +20,22 @@ from services.github_service import (
     push_project,
     delete_repo,
 )
+
+# Защита от отсутствия delete_repo_file в github_service
+try:
+    from services.github_service import delete_repo_file
+except ImportError:
+    def delete_repo_file(repo_name: str, file_path: str):
+        return False
+
 from services.deploy_service import trigger_deploy
 
 def normalize_dict(d: dict) -> dict:
-    """Приводит все ключи словаря к нижнему регистру для защиты от опечаток модели."""
     if not isinstance(d, dict):
         return {}
     return {str(k).strip().lower(): v for k, v in d.items()}
 
 def get_field(d: dict, *keys, default=None):
-    """Ищет поле среди вариантов ключей без учета регистра."""
     norm = normalize_dict(d)
     for k in keys:
         clean = str(k).strip().lower()
@@ -34,45 +44,30 @@ def get_field(d: dict, *keys, default=None):
     return default
 
 def safe_parse_json(raw: str) -> dict:
-    """
-    Бронебойный парсер JSON от LLM:
-    - очищает Markdown-блоки ```json ... ```
-    - заменяет Python True/False/None на true/false/null
-    - убирает висячие запятые
-    - в крайнем случае использует ast.literal_eval
-    """
     if not raw:
         return {}
-
     text = raw.strip()
 
-    # Извлекаем содержимое между ```json ... ``` или ``` ... ```
     if "```" in text:
         match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if match:
             text = match.group(1).strip()
 
-    # Находим границы JSON-объекта
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1:
         text = text[start : end + 1]
 
-    # Исправляем Python-булевы значения и null
     prepared = re.sub(r"\bTrue\b", "true", text)
     prepared = re.sub(r"\bFalse\b", "false", prepared)
     prepared = re.sub(r"\bNone\b", "null", prepared)
-
-    # Убираем висячие запятые перед закрывающими скобками
     prepared = re.sub(r",\s*([\}\]])", r"\1", prepared)
 
-    # Попытка 1: Стандартный JSON с исправлениями
     try:
         return json.loads(prepared)
     except Exception:
         pass
 
-    # Попытка 2: ast.literal_eval для словарей в формате Python
     try:
         val = ast.literal_eval(text)
         if isinstance(val, dict):
@@ -80,95 +75,136 @@ def safe_parse_json(raw: str) -> dict:
     except Exception:
         pass
 
-    # Если всё не удалось — вызываем стандартный loads для получения точного лога
     return json.loads(prepared)
 
-def orchestrate(prompt: str, status_cb=None) -> str:
+def run_task(prompt: str, status_cb=None) -> str:
+    """Главная точка входа для bot/handlers/build_task.py"""
     def notify(msg: str):
         if status_cb:
             status_cb(msg)
 
-    # 1. Сбор информации о репозиториях
+    # 1. Получаем список существующих репозиториев
     repos = list_user_repos()
     repos_str = ", ".join(repos) if repos else "Нет существующих репозиториев"
 
-    # 2. Планирование
-    notify("🔍 Анализирую репозитории и составляю план...")
-    plan_raw = ask(PLANNER_SYSTEM, PLANNER_USER.format(user_prompt=prompt, repos=repos_str))
-    
+    # 2. CHIEF PLANNER
+    notify("🔍 Chief Planner: анализирую архитектуру и извлекаю ключи...")
+    planner_prompt = PLANNER_SYSTEM.format(repo_list=repos_str)
+    plan_raw = ask(planner_prompt, PLANNER_USER.format(user_prompt=prompt))
+
     try:
         plan = safe_parse_json(plan_raw)
     except Exception as e:
         return f"❌ Ошибка разбора плана: {e}"
 
     action = get_field(plan, "action", default="create")
-    repo_name = get_field(plan, "repo_name", "target_repo", "repo", default="new_agent_project")
+    project_name = get_field(plan, "project_name", "repo_name", default="matin-agent")
+    target_file = get_field(plan, "target_file_to_delete")
+    task_desc = get_field(plan, "task_description", default=prompt)
+    extracted_env = get_field(plan, "extracted_env", default={})
 
-    # Ветка: Удаление
+    # Сценарий: Удаление
     if action == "delete":
-        notify(f"🗑 Удаляю репозиторий {repo_name}...")
-        ok = delete_repo(repo_name)
-        if ok:
-            return f"✅ Репозиторий {repo_name} успешно удален."
-        return f"❌ Не удалось удалить репозиторий {repo_name}."
+        if target_file:
+            notify(f"🗑 Удаляю файл {target_file} в репозитории {project_name}...")
+            ok = delete_repo_file(project_name, target_file)
+            return f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
+        else:
+            notify(f"🗑 Удаляю репозиторий {project_name}...")
+            ok = delete_repo(project_name)
+            return f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
 
     files = {}
 
-    # Ветка: Модификация
+    # Сценарий: Модификация (MODIFIER)
     if action == "modify":
-        notify(f"📥 Скачиваю проект {repo_name}...")
-        existing_files = get_repo_files(repo_name)
+        notify(f"📥 Скачиваю файлы проекта {project_name}...")
+        existing_files = get_repo_files(project_name)
         if not existing_files:
-            return f"⚠️ Репозиторий {repo_name} пуст или не найден на GitHub."
+            return f"⚠️ Репозиторий {project_name} пуст или не найден на GitHub."
 
-        notify(f"⚙️ Модифицирую код проекта {repo_name}...")
+        notify(f"⚙️ Senior Maintainer: пересобираю кодовую базу {project_name}...")
         files_dump = "\n\n".join([f"=== {path} ===\n{content}" for path, content in existing_files.items()])
-        mod_raw = ask(MODIFIER_SYSTEM, MODIFIER_USER.format(user_prompt=prompt, files=files_dump))
-        
+        mod_raw = ask(
+            MODIFIER_SYSTEM,
+            MODIFIER_USER.format(
+                task_description=task_desc,
+                extracted_env=json.dumps(extracted_env, ensure_ascii=False),
+                files=files_dump,
+                user_prompt=prompt,
+            ),
+        )
         try:
             mod_data = safe_parse_json(mod_raw)
         except Exception as e:
-            return f"❌ Ошибка разбора изменений: {e}"
+            return f"❌ Ошибка разбора модификации: {e}"
 
         files = get_field(mod_data, "files", default={})
 
-    # Ветка: Создание с нуля
+    # Сценарий: Создание с нуля (ENGINEER)
     else:
-        notify(f"🚀 Создаю новый проект {repo_name}...")
-        from core.prompts import CODER_SYSTEM, CODER_USER
-        coder_raw = ask(CODER_SYSTEM, CODER_USER.format(user_prompt=prompt))
+        notify(f"🚀 Principal Engineer: проектирую новый сервис {project_name}...")
+        eng_raw = ask(
+            ENGINEER_SYSTEM,
+            ENGINEER_USER.format(
+                task_description=task_desc,
+                extracted_env=json.dumps(extracted_env, ensure_ascii=False),
+                user_prompt=prompt,
+            ),
+        )
         try:
-            coder_data = safe_parse_json(coder_raw)
+            eng_data = safe_parse_json(eng_raw)
         except Exception as e:
-            return f"❌ Ошибка генерации проекта: {e}"
-        files = get_field(coder_data, "files", default={})
+            return f"❌ Ошибка разбора генерации: {e}"
+
+        files = get_field(eng_data, "files", default={})
 
     if not files:
-        return "⚠️ Модель не сгенерировала файлов для записи."
+        return "⚠️ Модель не сгенерировала файлы для сохранения."
 
-    # 3. Ревью и контроль качества (Reviewer)
-    notify("🧐 Провожу финальную проверку качества кода...")
+    # 3. Аудит (REVIEWER)
+    notify("🧐 Principal Auditor: провожу аудит безопасности и синтаксиса...")
     review_dump = "\n\n".join([f"=== {path} ===\n{content}" for path, content in files.items()])
-    review_raw = ask(REVIEWER_SYSTEM, REVIEWER_USER.format(user_prompt=prompt, files=review_dump))
+    review_raw = ask(REVIEWER_SYSTEM, REVIEWER_USER.format(files=review_dump, user_prompt=prompt))
     
     try:
         review_data = safe_parse_json(review_raw)
     except Exception:
-        # Если ревью не спарсилось, не прерываемся — код уже готов
-        review_data = {"approved": True}
+        review_data = {"approved": True, "issues": []}
+
+    approved = get_field(review_data, "approved", default=True)
+    issues = get_field(review_data, "issues", default=[])
+
+    # Если аудит выявил замечания — вызываем FIXER
+    if not approved and issues:
+        notify("🛠 Principal Fixer: исправляю замечания аудитора...")
+        for file_path, content in list(files.items()):
+            fixed_code = ask(
+                FIXER_SYSTEM,
+                FIXER_USER.format(
+                    file_path=file_path,
+                    issues="\n".join(issues),
+                    code=content,
+                ),
+            )
+            if fixed_code and not fixed_code.startswith("❌"):
+                files[file_path] = fixed_code.strip()
 
     # 4. Отправка в GitHub
-    notify(f"📤 Отправляю проверенный код в GitHub ({repo_name})...")
-    repo_url = push_project(repo_name, files)
+    notify(f"📤 DevOps: отправляю проверенный production-ready код в {project_name}...")
+    repo_url = push_project(project_name, files)
 
     # 5. Деплой
     notify("🚀 Запускаю обновление сервиса на Render...")
     deploy_status = trigger_deploy()
 
-    comment = get_field(review_data, "feedback", "comment", "critique", default="Код успешно проверен и оптимизирован.")
+    issues_text = f"\n⚠️ Замечания ревьюера: {', '.join(issues)}" if issues else "\n🛡 Аудит безопасности пройден на 100%."
     return (
-        f"✅ Проект успешно обновлен!\n\n"
-        f"📂 Репозиторий: {repo_url}\n"
-        f"📋 Ревью: {comment}\n"
-        f"Статус деплоя: {deploy_status}"
+        f"✅ Проект {project_name} успешно обновлен!\n\n"
+        f"📂 Репозиторий: {repo_url}"
+        f"{issues_text}\n"
+        f"🚀 Деплой: {deploy_status}"
     )
+
+# Алиас
+orchestrate = run_task

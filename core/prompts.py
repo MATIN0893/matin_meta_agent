@@ -153,6 +153,6 @@ FIXER_USER = """Файл: {file_path}
 {code}
 """
 
-# Алиасы для полной совместимости
+# Алиасы
 CODER_SYSTEM = ENGINEER_SYSTEM
 CODER_USER = ENGINEER_USER
