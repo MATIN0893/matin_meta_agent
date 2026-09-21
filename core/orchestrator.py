@@ -1,4 +1,6 @@
 import ast
+import asyncio
+import inspect
 import json
 import re
 from core.llm_client import ask
@@ -21,7 +23,6 @@ from services.github_service import (
     delete_repo,
 )
 
-# Защита от отсутствия delete_repo_file в github_service
 try:
     from services.github_service import delete_repo_file
 except ImportError:
@@ -77,20 +78,28 @@ def safe_parse_json(raw: str) -> dict:
 
     return json.loads(prepared)
 
-def run_task(prompt: str, status_cb=None) -> str:
-    """Главная точка входа для bot/handlers/build_task.py"""
-    def notify(msg: str):
+async def run_task(prompt: str, status_cb=None) -> str:
+    """Асинхронная главная точка входа для оркестратора."""
+    async def notify(msg: str):
         if status_cb:
-            status_cb(msg)
+            try:
+                if inspect.iscoroutinefunction(status_cb):
+                    await status_cb(msg)
+                else:
+                    res = status_cb(msg)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception:
+                pass
 
     # 1. Получаем список существующих репозиториев
-    repos = list_user_repos()
+    repos = await asyncio.to_thread(list_user_repos)
     repos_str = ", ".join(repos) if repos else "Нет существующих репозиториев"
 
     # 2. CHIEF PLANNER
-    notify("🔍 Chief Planner: анализирую архитектуру и извлекаю ключи...")
+    await notify("🔍 Chief Planner: анализирую архитектуру и извлекаю ключи...")
     planner_prompt = PLANNER_SYSTEM.format(repo_list=repos_str)
-    plan_raw = ask(planner_prompt, PLANNER_USER.format(user_prompt=prompt))
+    plan_raw = await asyncio.to_thread(ask, planner_prompt, PLANNER_USER.format(user_prompt=prompt))
 
     try:
         plan = safe_parse_json(plan_raw)
@@ -106,26 +115,27 @@ def run_task(prompt: str, status_cb=None) -> str:
     # Сценарий: Удаление
     if action == "delete":
         if target_file:
-            notify(f"🗑 Удаляю файл {target_file} в репозитории {project_name}...")
-            ok = delete_repo_file(project_name, target_file)
+            await notify(f"🗑 Удаляю файл {target_file} в репозитории {project_name}...")
+            ok = await asyncio.to_thread(delete_repo_file, project_name, target_file)
             return f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
         else:
-            notify(f"🗑 Удаляю репозиторий {project_name}...")
-            ok = delete_repo(project_name)
+            await notify(f"🗑 Удаляю репозиторий {project_name}...")
+            ok = await asyncio.to_thread(delete_repo, project_name)
             return f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
 
     files = {}
 
     # Сценарий: Модификация (MODIFIER)
     if action == "modify":
-        notify(f"📥 Скачиваю файлы проекта {project_name}...")
-        existing_files = get_repo_files(project_name)
+        await notify(f"📥 Скачиваю файлы проекта {project_name}...")
+        existing_files = await asyncio.to_thread(get_repo_files, project_name)
         if not existing_files:
             return f"⚠️ Репозиторий {project_name} пуст или не найден на GitHub."
 
-        notify(f"⚙️ Senior Maintainer: пересобираю кодовую базу {project_name}...")
+        await notify(f"⚙️ Senior Maintainer: пересобираю кодовую базу {project_name}...")
         files_dump = "\n\n".join([f"=== {path} ===\n{content}" for path, content in existing_files.items()])
-        mod_raw = ask(
+        mod_raw = await asyncio.to_thread(
+            ask,
             MODIFIER_SYSTEM,
             MODIFIER_USER.format(
                 task_description=task_desc,
@@ -143,8 +153,9 @@ def run_task(prompt: str, status_cb=None) -> str:
 
     # Сценарий: Создание с нуля (ENGINEER)
     else:
-        notify(f"🚀 Principal Engineer: проектирую новый сервис {project_name}...")
-        eng_raw = ask(
+        await notify(f"🚀 Principal Engineer: проектирую новый сервис {project_name}...")
+        eng_raw = await asyncio.to_thread(
+            ask,
             ENGINEER_SYSTEM,
             ENGINEER_USER.format(
                 task_description=task_desc,
@@ -163,9 +174,9 @@ def run_task(prompt: str, status_cb=None) -> str:
         return "⚠️ Модель не сгенерировала файлы для сохранения."
 
     # 3. Аудит (REVIEWER)
-    notify("🧐 Principal Auditor: провожу аудит безопасности и синтаксиса...")
+    await notify("🧐 Principal Auditor: провожу аудит безопасности и синтаксиса...")
     review_dump = "\n\n".join([f"=== {path} ===\n{content}" for path, content in files.items()])
-    review_raw = ask(REVIEWER_SYSTEM, REVIEWER_USER.format(files=review_dump, user_prompt=prompt))
+    review_raw = await asyncio.to_thread(ask, REVIEWER_SYSTEM, REVIEWER_USER.format(files=review_dump, user_prompt=prompt))
     
     try:
         review_data = safe_parse_json(review_raw)
@@ -177,9 +188,10 @@ def run_task(prompt: str, status_cb=None) -> str:
 
     # Если аудит выявил замечания — вызываем FIXER
     if not approved and issues:
-        notify("🛠 Principal Fixer: исправляю замечания аудитора...")
+        await notify("🛠 Principal Fixer: исправляю замечания аудитора...")
         for file_path, content in list(files.items()):
-            fixed_code = ask(
+            fixed_code = await asyncio.to_thread(
+                ask,
                 FIXER_SYSTEM,
                 FIXER_USER.format(
                     file_path=file_path,
@@ -191,12 +203,12 @@ def run_task(prompt: str, status_cb=None) -> str:
                 files[file_path] = fixed_code.strip()
 
     # 4. Отправка в GitHub
-    notify(f"📤 DevOps: отправляю проверенный production-ready код в {project_name}...")
-    repo_url = push_project(project_name, files)
+    await notify(f"📤 DevOps: отправляю проверенный production-ready код в {project_name}...")
+    repo_url = await asyncio.to_thread(push_project, project_name, files)
 
     # 5. Деплой
-    notify("🚀 Запускаю обновление сервиса на Render...")
-    deploy_status = trigger_deploy()
+    await notify("🚀 Запускаю обновление сервиса на Render...")
+    deploy_status = await asyncio.to_thread(trigger_deploy)
 
     issues_text = f"\n⚠️ Замечания ревьюера: {', '.join(issues)}" if issues else "\n🛡 Аудит безопасности пройден на 100%."
     return (
@@ -206,5 +218,4 @@ def run_task(prompt: str, status_cb=None) -> str:
         f"🚀 Деплой: {deploy_status}"
     )
 
-# Алиас
 orchestrate = run_task
