@@ -21,13 +21,23 @@ from services.deploy_service import trigger_deploy
 MAX_FIX_ATTEMPTS = 3
 
 def extract_json(text: str) -> dict:
-    clean = re.sub(r"```json|```", "", text).strip()
-    # Удаляем возможные спецсимволы до первой фигурной скобки
+    clean = re.sub(r"```(?:json)?", "", text).strip()
     start = clean.find("{")
     end = clean.rfind("}")
     if start != -1 and end != -1:
         clean = clean[start : end + 1]
-    return json.loads(clean)
+    
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError:
+        # Убираем trailing commas перед закрывающими скобками
+        clean_fixed = re.sub(r",\s*([\]}])", r"\1", clean)
+        data = json.loads(clean_fixed)
+        
+    if isinstance(data, dict):
+        # Очищаем ключи от лишних пробелов и переводов строк
+        return {k.strip(): v for k, v in data.items()}
+    return data
 
 async def run_task(user_prompt: str, progress_cb=None) -> str:
     try:

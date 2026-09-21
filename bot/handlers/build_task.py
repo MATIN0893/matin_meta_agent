@@ -15,7 +15,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⚙️ Принял задачу, начинаю...")
 
     async def progress(step: str):
-        await msg.edit_text(f"⚙️ {step}")
+        try:
+            await msg.edit_text(f"⚙️ {step}", parse_mode="HTML")
+        except Exception:
+            pass
 
     result = await run_task(text, progress)
-    await msg.edit_text(result)
+    try:
+        await msg.edit_text(result, parse_mode="HTML")
+    except Exception:
+        await msg.edit_text(result)
