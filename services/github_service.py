@@ -50,12 +50,22 @@ def push_project(project_name: str, files: dict) -> str:
     return repo.html_url
 
 def delete_repo_file(project_name: str, filename: str) -> bool:
-    """Удаляет файл из репозитория."""
+    """Удаляет отдельный файл из репозитория."""
     user = g.get_user()
-    repo = user.get_repo(project_name)
     try:
+        repo = user.get_repo(project_name)
         existing = repo.get_contents(filename)
         repo.delete_file(filename, f"Delete {filename}", existing.sha)
+        return True
+    except Exception:
+        return False
+
+def delete_repo(project_name: str) -> bool:
+    """Полностью удаляет репозиторий с GitHub."""
+    user = g.get_user()
+    try:
+        repo = user.get_repo(project_name)
+        repo.delete()
         return True
     except Exception:
         return False
