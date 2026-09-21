@@ -4,16 +4,19 @@ from config.settings import GITHUB_TOKEN, GITHUB_USERNAME
 
 IGNORE_DIRS = {
     ".git", ".github", ".venv", "venv", "env", "__pycache__",
-    ".pytest_cache", ".idea", ".vscode", "node_modules", "dist", "build"
+    ".pytest_cache", ".idea", ".vscode", "node_modules", "dist", "build", "logs"
 }
 
 IGNORE_EXTENSIONS = {
     ".pyc", ".pyo", ".pyd", ".png", ".jpg", ".jpeg", ".gif",
     ".ico", ".svg", ".webp", ".zip", ".tar", ".gz", ".exe",
-    ".dll", ".so", ".dylib", ".pdf", ".woff", ".woff2", ".ttf"
+    ".dll", ".so", ".dylib", ".pdf", ".woff", ".woff2", ".ttf",
+    ".lock", ".log", ".sqlite", ".sqlite3", ".db", ".csv", ".session",
+    ".session-journal"
 }
 
-MAX_FILE_SIZE_BYTES = 150 * 1024  # 150 KB
+# Ограничение размера одного файла в 50 КБ, чтобы не сжигать лимиты токенов
+MAX_FILE_SIZE_BYTES = 50 * 1024
 
 def get_github_client() -> Github:
     if not GITHUB_TOKEN:
@@ -52,19 +55,22 @@ def get_repo_files(repo_name: str) -> dict:
             contents = [contents]
 
         for item in contents:
-            # Пропускаем служебные директории
             if item.type == "dir":
                 if item.name.lower() in IGNORE_DIRS:
                     continue
                 fetch_recursive(item.path)
             elif item.type == "file":
-                # Пропускаем бинарники и мусорные расширения
-                _, ext = os.path.splitext(item.name.lower())
+                name_lower = item.name.lower()
+                _, ext = os.path.splitext(name_lower)
+                
+                # Игнорируем lock-файлы и мусор
+                if name_lower in ("poetry.lock", "package-lock.json", "yarn.lock"):
+                    continue
                 if ext in IGNORE_EXTENSIONS:
                     continue
-                # Пропускаем слишком большие файлы
                 if item.size > MAX_FILE_SIZE_BYTES:
                     continue
+
                 try:
                     content_str = item.decoded_content.decode("utf-8", errors="ignore")
                     files_dict[item.path] = content_str
