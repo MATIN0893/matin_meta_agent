@@ -3,8 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Поддерживаем оба варианта названия токена
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+# Поддерживаем все три варианта названия токена
+BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TG_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN", "")
+)
 TG_BOT_TOKEN = BOT_TOKEN
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
