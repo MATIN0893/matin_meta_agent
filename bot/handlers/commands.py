@@ -4,7 +4,7 @@ from services.github_service import list_user_repos
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Matin Meta Agent*\n\n"
+        "🤖 <b>Matin Meta Agent</b>\n\n"
         "Опиши задачу текстом:\n"
         "— Создать новый проект с нуля\n"
         "— Либо изменить существующий проект\n\n"
@@ -12,7 +12,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — справка\n"
         "/repos — список твоих репозиториев на GitHub\n"
         "/status — статус последней задачи",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23,13 +23,14 @@ async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("Репозитории не найдены.")
             return
 
-        formatted = "\n".join([f"• `{name}`" for name in repo_list])
-        await msg.edit_text(
-            f"📁 *Твои репозитории:*\n\n{formatted}\n\n"
+        formatted = "\n".join([f"• <code>{name}</code>" for name in repo_list])
+        text = (
+            f"📁 <b>Твои репозитории:</b>\n\n"
+            f"{formatted}\n\n"
             f"Чтобы изменить проект, отправь задачу вида:\n"
-            f"_В проекте имя_репозитория добавь/исправь..._",
-            parse_mode="Markdown"
+            f"<i>В проекте имя_репозитория добавь/исправь...</i>"
         )
+        await msg.edit_text(text, parse_mode="HTML")
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка GitHub: {e}")
 
@@ -39,7 +40,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активных задач.")
         return
     await update.message.reply_text(
-        f"📊 Статус: `{task.get('status', 'unknown')}`\n"
-        f"Проект: `{task.get('project_name', '?')}`",
-        parse_mode="Markdown"
+        f"📊 Статус: <code>{task.get('status', 'unknown')}</code>\n"
+        f"Проект: <code>{task.get('project_name', '?')}</code>",
+        parse_mode="HTML"
     )
