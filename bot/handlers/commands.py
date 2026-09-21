@@ -1,19 +1,37 @@
 from telegram import Update
 from telegram.ext import ContextTypes
+from services.github_service import list_user_repos
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Matin Meta Agent*\n\n"
-        "Опиши что нужно создать — я напишу код, запушу на GitHub и задеплою на Render.\n\n"
+        "Опиши задачу текстом:\n"
+        "— Создать новый проект с нуля\n"
+        "— Либо изменить существующий проект\n\n"
         "Команды:\n"
-        "/start — это сообщение\n"
-        "/repos — мои проекты\n"
+        "/start — справка\n"
+        "/repos — список твоих репозиториев на GitHub\n"
         "/status — статус последней задачи",
         parse_mode="Markdown"
     )
 
 async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📁 Проекты: (скоро)")
+    msg = await update.message.reply_text("🔍 Загружаю список репозиториев...")
+    try:
+        repo_list = list_user_repos()
+        if not repo_list:
+            await msg.edit_text("Репозитории не найдены.")
+            return
+
+        formatted = "\n".join([f"• `{name}`" for name in repo_list])
+        await msg.edit_text(
+            f"📁 *Твои репозитории:*\n\n{formatted}\n\n"
+            f"Чтобы изменить проект, отправь задачу вида:\n"
+            f"_В проекте имя_репозитория добавь/исправь..._",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка GitHub: {e}")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = context.bot_data.get("current_task")
