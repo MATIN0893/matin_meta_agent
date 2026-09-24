@@ -5,7 +5,7 @@ from core.orchestrator import run_task
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ALLOWED_USERS:
+    if str(user_id) not in str(ALLOWED_USERS):
         return
 
     text = update.message.text.strip()
