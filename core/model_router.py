@@ -1,23 +1,29 @@
-from dotenv import load_dotenv
-load_dotenv()
 import os
 import requests
+from dotenv import load_dotenv
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+load_dotenv()
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 DEFAULT_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "nex-agi/nex-n2.5-mini:free",
-    "nex-agi/nex-n2.5-pro:free",
     "inclusionai/ling-3.0-flash-sante:free"
 ]
 
+def get_api_key() -> str:
+    key = os.getenv("OPENROUTER_API_KEY", "")
+    return key.strip()
+
 def query_model(prompt: str, system_prompt: str = "") -> str:
-    if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY отсутствует в .env")
+    api_key = get_api_key()
+    if not api_key:
+        raise ValueError("OPENROUTER_API_KEY отсутствует или пуст")
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/MATIN0893",
         "X-Title": "Matin Meta Agent"
@@ -46,4 +52,3 @@ def query_model(prompt: str, system_prompt: str = "") -> str:
             continue
 
     raise RuntimeError(f"Все модели недоступны. Последняя: {last_error}")
-
