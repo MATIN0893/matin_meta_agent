@@ -64,3 +64,10 @@ def check_llm_health() -> bool:
         return True
     except Exception:
         return False
+
+def ask(prompt: str, system_prompt: str = "") -> str:
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return call_llm(messages)
