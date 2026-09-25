@@ -11,7 +11,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
-DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
 def call_llm(messages: list, temperature: float = 0.7, max_tokens: int = 1500) -> str:

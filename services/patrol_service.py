@@ -7,7 +7,7 @@ from enum import Enum
 import httpx
 from telegram import Bot
 from services.render_service import get_services, get_service_logs, restart_service
-from core.llm_client import call_llm
+from core.llm_client import check_llm_health
 
 logger = logging.getLogger("MATIN.PATROL")
 
@@ -40,7 +40,7 @@ async def notify(bot: Bot, text: str):
 def check_self_brain() -> bool:
     """Самодиагностика: Мета проверяет свой собственный мозг"""
     try:
-        res = call_llm([{"role": "system", "content": "pong"}, {"role": "user", "content": "ping"}])
+        res = check_llm_health()
         return bool(res)
     except Exception as e:
         logger.error(f"[SELF-CHECK] Мозг недоступен: {e}")
