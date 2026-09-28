@@ -24,38 +24,158 @@ from services.github_service import (
 )
 
 try:
+    from json_repair import repair_json
+except ImportError:
+    repair_json = None
+
+try:
     from services.github_service import delete_repo_file
 except ImportError:
     def delete_repo_file(repo_name: str, file_path: str):
         return False
 
 
+JSON_ESCAPE_RULE = """
+
+СТРОГОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ JSON:
+- Твой ответ должен быть СТРОГО валидным JSON-объектом без пояснительного текста вокруг и без markdown-тегов.
+- Внутри JSON-строк (особенно в коде файлов):
+  1. ВСЕ переносы строк ДОЛЖНЫ быть экранированы как \\n (ЗАПРЕЩЕНО вставлять реальные переносы строк внутри строковых значений JSON).
+  2. ВСЕ двойные кавычки внутри кода ДОЛЖНЫ быть экранированы как \\\" (или используй одинарные кавычки ' в Python-коде).
+  3. ВСЕ обратные слэши должны быть экранированы как \\\\.
+- Строго соблюдай синтаксис JSON: никаких висячих запятых, закрывай все скобки и кавычки.
+"""
+
+
+def is_plausible_file_path(path: str) -> bool:
+    if not path or " " in path:
+        return False
+    if path.lower() in {
+        "action", "project_name", "target_file", "task_description",
+        "code", "files", "env", "file_path", "explanation", "status",
+        "plan", "issues", "type", "description"
+    }:
+        return False
+    return "." in path or "/" in path
+
+
+def clean_code_snippet(code: str) -> str:
+    if not isinstance(code, str):
+        return ""
+    code = code.strip()
+    if code.startswith("```"):
+        lines = code.splitlines()
+        if len(lines) > 1 and lines[-1].strip().startswith("```"):
+            code = "\n".join(lines[1:-1])
+        elif len(lines) > 1:
+            code = "\n".join(lines[1:])
+    return code
+
+
+def extract_regex_fields(text: str) -> dict:
+    result = {}
+
+    # Сканирование простых строковых полей
+    for field in ["action", "project_name", "target_file", "file_path", "status"]:
+        m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
+        if m:
+            result[field] = m.group(1).strip()
+
+    # Сканирование многострочных полей (код, план, пояснение)
+    for field in ["code", "task_description", "plan", "explanation"]:
+        m = re.search(rf'"{field}"\s*:\s*"(.*?)"(?=\s*,\s*"[a-zA-Z_]+"|\s*}})', text, re.DOTALL)
+        if m:
+            val = m.group(1)
+            val = val.replace('\\"', '"').replace('\\\\', '\\')
+            result[field] = val
+
+    # Сканирование файлов проекта
+    files = {}
+    files_block_match = re.search(r'"files"\s*:\s*\{(.*?)\}(?=\s*,\s*"[a-zA-Z_]+"|\s*$|\s*\})', text, re.DOTALL)
+    block = files_block_match.group(1) if files_block_match else text
+
+    file_matches = re.finditer(r'"([a-zA-Z0-9_./\-]+)"\s*:\s*"(.*?)"(?=\s*,\s*"[a-zA-Z0-9_./\-]+"|\s*$|\s*\})', block, re.DOTALL)
+    for fm in file_matches:
+        f_name = fm.group(1).strip()
+        if is_plausible_file_path(f_name):
+            content = fm.group(2).replace('\\"', '"').replace('\\\\', '\\')
+            files[f_name] = clean_code_snippet(content)
+
+    if not files and "file_path" in result and "code" in result:
+        files[result["file_path"]] = clean_code_snippet(result["code"])
+
+    if files:
+        result["files"] = files
+
+    return result
+
+
 def safe_parse_json(text: str) -> dict:
-    """Извлекает и парсит JSON даже при наличии markdown-разметки или текста."""
+    """Извлекает и парсит JSON даже при наличии markdown-разметки или неэкранированных строк."""
     if not text or not isinstance(text, str):
-        raise ValueError("Пустой ответ модели.")
+        return {}
     cleaned = text.strip()
+
+    # 1. Очистка от markdown-тегов (```json ... ```)
+    code_match = re.search(r"```(?:json|python)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+    candidate = code_match.group(1).strip() if code_match else cleaned
+
+    # 2. Стандартный json.loads (строгий и нестрогий режим)
     try:
-        return json.loads(cleaned)
+        data = json.loads(candidate)
+        if isinstance(data, dict):
+            return data
     except Exception:
         pass
 
-    code_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
-    if code_match:
-        block = code_match.group(1).strip()
+    try:
+        data = json.loads(candidate, strict=False)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 3. Подключение json_repair (если доступен)
+    if repair_json is not None:
         try:
-            return json.loads(block)
+            repaired = repair_json(candidate, return_objects=True)
+            if isinstance(repaired, dict):
+                return repaired
+            if isinstance(repaired, str):
+                loaded = json.loads(repaired, strict=False)
+                if isinstance(loaded, dict):
+                    return loaded
         except Exception:
             pass
 
+    # 4. ast.literal_eval для Python-синтаксиса
+    try:
+        py_cand = candidate
+        py_cand = re.sub(r'\btrue\b', 'True', py_cand)
+        py_cand = re.sub(r'\bfalse\b', 'False', py_cand)
+        py_cand = re.sub(r'\bnull\b', 'None', py_cand)
+        res = ast.literal_eval(py_cand)
+        if isinstance(res, dict):
+            return res
+    except Exception:
+        pass
+
+    # 5. Прямое регулярное извлечение полей без падения
+    extracted = extract_regex_fields(candidate)
+    if extracted:
+        return extracted
+
+    # 6. Поиск любого внешнего JSON-блока { ... }
     obj_match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
     if obj_match:
         try:
-            return json.loads(obj_match.group(1).strip())
+            data = json.loads(obj_match.group(1).strip(), strict=False)
+            if isinstance(data, dict):
+                return data
         except Exception:
             pass
 
-    return json.loads(cleaned)
+    return {}
 
 
 def get_field(data, key: str, default=None):
@@ -85,11 +205,18 @@ async def run_task(prompt: str, status_cb=None) -> str:
     except Exception:
         planner_prompt = PLANNER_SYSTEM
 
-    plan_raw = await asyncio.to_thread(ask, planner_prompt, PLANNER_USER.format(user_prompt=prompt))
+    plan_raw = await asyncio.to_thread(
+        ask,
+        planner_prompt + JSON_ESCAPE_RULE,
+        PLANNER_USER.format(user_prompt=prompt),
+    )
     try:
         plan = safe_parse_json(plan_raw)
     except Exception as e:
         return f"❌ Ошибка разбора плана: {e}"
+
+    if not plan:
+        return "❌ Ошибка разбора плана: модель вернула некорректный ответ."
 
     action = get_field(plan, "action", default="modify")
     project_name = get_field(plan, "project_name", default="matin-agent")
@@ -104,7 +231,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
             ok = await asyncio.to_thread(delete_repo_file, project_name, target_file)
             return f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
         else:
-            await notify(f"🗑 Удаляю репозиторий {project_name}...\\\")
+            await notify(f"🗑 Удаляю репозиторий {project_name}...")
             ok = await asyncio.to_thread(delete_repo, project_name)
             return f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
 
@@ -146,7 +273,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
         mod_raw = await asyncio.to_thread(
             ask,
-            MODIFIER_SYSTEM,
+            MODIFIER_SYSTEM + JSON_ESCAPE_RULE,
             MODIFIER_USER.format(
                 task_description=task_desc,
                 extracted_env=json.dumps(extracted_env, ensure_ascii=False),
@@ -159,13 +286,17 @@ async def run_task(prompt: str, status_cb=None) -> str:
         except Exception as e:
             return f"❌ Ошибка разбора модификации: {e}"
         files = mod_data.get("files", {})
+        if not files and get_field(mod_data, "code"):
+            target_path = get_field(mod_data, "file_path") or target_file
+            if target_path:
+                files[target_path] = clean_code_snippet(mod_data["code"])
 
     # Сценарий: Создание нового проекта (ENGINEER)
     else:
         await notify(f"⚙️ Lead Engineer: генерирую проект {project_name}...")
         eng_raw = await asyncio.to_thread(
             ask,
-            ENGINEER_SYSTEM,
+            ENGINEER_SYSTEM + JSON_ESCAPE_RULE,
             ENGINEER_USER.format(
                 task_description=task_desc,
                 extracted_env=json.dumps(extracted_env, ensure_ascii=False),
@@ -177,6 +308,10 @@ async def run_task(prompt: str, status_cb=None) -> str:
         except Exception as e:
             return f"❌ Ошибка разбора генерации: {e}"
         files = eng_data.get("files", {})
+        if not files and get_field(eng_data, "code"):
+            target_path = get_field(eng_data, "file_path") or target_file
+            if target_path:
+                files[target_path] = clean_code_snippet(eng_data["code"])
 
     if not files:
         return "⚠️ Не удалось получить файлы для сохранения."
@@ -187,7 +322,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
     try:
         review_raw = await asyncio.to_thread(
             ask,
-            REVIEWER_SYSTEM,
+            REVIEWER_SYSTEM + JSON_ESCAPE_RULE,
             REVIEWER_USER.format(files=review_dump, user_prompt=prompt),
         )
         review_data = safe_parse_json(review_raw)
@@ -202,7 +337,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
         try:
             fix_raw = await asyncio.to_thread(
                 ask,
-                FIXER_SYSTEM,
+                FIXER_SYSTEM + JSON_ESCAPE_RULE,
                 FIXER_USER.format(
                     files=review_dump,
                     issues=json.dumps(review_data.get("issues", []), ensure_ascii=False),
@@ -210,7 +345,13 @@ async def run_task(prompt: str, status_cb=None) -> str:
                 ),
             )
             fix_data = safe_parse_json(fix_raw)
-            files = fix_data.get("files", files)
+            fix_files = fix_data.get("files", {})
+            if fix_files:
+                files = fix_files
+            elif get_field(fix_data, "code"):
+                target_path = get_field(fix_data, "file_path") or target_file
+                if target_path:
+                    files[target_path] = clean_code_snippet(fix_data["code"])
         except Exception:
             pass
 
