@@ -3,7 +3,11 @@ import os
 from telegram import Update
 from telegram.ext import ContextTypes
 from config.settings import is_user_allowed
-from services.github_service import list_user_repos
+from services.github_service import (
+    get_user_repositories,
+    format_repositories_list,
+    list_user_repos,
+)
 from services.patrol_service import STATE, check_self_brain, ServiceState
 from services.render_service import get_services
 
@@ -82,12 +86,16 @@ async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔍 Запрашиваю список репозиториев с GitHub...")
     try:
-        repos_list = list_user_repos()
-        if not repos_list:
+        repos_data = await asyncio.to_thread(get_user_repositories)
+        if not repos_data:
             await update.message.reply_text("📁 У тебя пока нет доступных репозиториев или не настроен токен GitHub.")
             return
 
-        text = "📁 **Твои репозитории на GitHub:**\n\n" + "\n".join([f"• `{r}`" for r in repos_list[:15]])
-        await update.message.reply_text(text, parse_mode="Markdown")
+        text = format_repositories_list(repos_data)
+        if len(text) > 4000:
+            for i in range(0, len(text), 4000):
+                await update.message.reply_text(text[i:i+4000], parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при получении репозиториев: {e}")

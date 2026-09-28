@@ -21,7 +21,14 @@ from services.github_service import (
     get_repo_files,
     push_project,
     delete_repo,
+    delete_repo_file,
+    get_user_repositories,
+    find_matching_repo,
+    find_matching_repo_name,
+    format_repositories_list,
+    is_repo_list_intent,
 )
+from config.settings import GITHUB_USERNAME
 
 try:
     from services.patrol_service import record_brain_success
@@ -33,13 +40,6 @@ try:
     from json_repair import repair_json
 except ImportError:
     repair_json = None
-
-try:
-    from services.github_service import delete_repo_file
-except ImportError:
-    def delete_repo_file(repo_name: str, file_path: str):
-        return False
-
 
 JSON_ESCAPE_RULE = """
 
@@ -190,7 +190,6 @@ def collect_project_files(parsed_data: dict, raw_text: str = "", default_target:
     """Устойчивый сборщик файлов проекта из различных вариантов ответа LLM."""
     extracted = {}
 
-    # 1. Проверка всех возможных ключей словаря
     if isinstance(parsed_data, dict):
         for key in ["files", "modified_files", "updated_files", "new_files", "changed_files", "source_files", "code_files"]:
             val = parsed_data.get(key)
@@ -208,36 +207,29 @@ def collect_project_files(parsed_data: dict, raw_text: str = "", default_target:
                         if fpath and fcontent and isinstance(fcontent, str):
                             extracted[str(fpath).strip()] = clean_code_snippet(fcontent)
 
-        # 2. Одиночные поля (file_path + code)
         if not extracted:
             fpath = parsed_data.get("file_path") or parsed_data.get("target_file") or parsed_data.get("filename") or parsed_data.get("file")
             code = parsed_data.get("code") or parsed_data.get("content")
             if fpath and code and isinstance(code, str):
                 extracted[str(fpath).strip()] = clean_code_snippet(code)
 
-    # 3. Резервный парсинг markdown-блоков с именами файлов
     if not extracted and raw_text:
-        # Паттерн 1: ```python:path/to/file.py
         p1 = re.compile(r"""```(?:python|py|json|sh|bash)?(?::|\s+title=['"]?|\s+file=['"]?|\s+filename=['"]?|\s+path=['"]?|\s+)([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)['"]?\s*\n(.*?)```""", re.DOTALL)
         for m in p1.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
-        # Паттерн 2: # file: path/to/file.py внутри блока
         p2 = re.compile(r"""```(?:[a-zA-Z0-9_\-]+)?\s*\n\s*(?:#|//|--)\s*(?:file(?:path|name)?|path):\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*\n(.*?)```""", re.DOTALL)
         for m in p2.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
-        # Паттерн 3: === path/to/file.py ===
         p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+\s*===)|\Z)""", re.DOTALL)
         for m in p3.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
-        # Паттерн 4: ### path/to/file.py
         p4 = re.compile(r"""#{1,4}\s*[`'"]?([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)[`'"]?\s*\n\s*```(?:[a-zA-Z0-9_\-]+)?\s*\n(.*?)```""", re.DOTALL)
         for m in p4.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
-    # 4. Если extracted всё ещё пуст, берем target_file или подбираем подходящий файл
     if not extracted:
         candidate_code = ""
         if isinstance(parsed_data, dict):
@@ -282,6 +274,12 @@ async def run_task(prompt: str, status_cb=None) -> str:
             except Exception:
                 pass
 
+    # 1. Быстрый перехват намерения запросить список репозиториев
+    if is_repo_list_intent(prompt):
+        await notify("📁 Запрашиваю список репозиториев с GitHub...")
+        repos_data = await asyncio.to_thread(get_user_repositories)
+        return format_repositories_list(repos_data)
+
     await notify("🧠 Анализирую задачу и составляю план...")
     user_repos = await asyncio.to_thread(list_user_repos)
     repo_names_str = ", ".join(user_repos) if user_repos else "нет репозиториев"
@@ -312,8 +310,33 @@ async def run_task(prompt: str, status_cb=None) -> str:
     task_desc = get_field(plan, "task_description", default=prompt)
     extracted_env = get_field(plan, "env", default={})
 
+    # Сценарий: Запрос списка репозиториев из ответа LLM
+    if action in ("list", "list_repos", "repos", "list_projects"):
+        await notify("📁 Запрашиваю список репозиториев с GitHub...")
+        repos_data = await asyncio.to_thread(get_user_repositories)
+        return format_repositories_list(repos_data)
+
+    # Проверка: если LLM посчитал имя аккаунта именем репозитория
+    owner_name = (GITHUB_USERNAME or "MATIN0893").strip().lower()
+    if project_name and project_name.strip().lower() in (owner_name, "matin0893"):
+        repos_data = await asyncio.to_thread(get_user_repositories)
+        exact_repo_exists = any(r.get("name", "").lower() == project_name.strip().lower() for r in repos_data)
+        if not exact_repo_exists:
+            if is_repo_list_intent(prompt) or any(w in prompt.lower() for w in ["репозитор", "проект", "repo", "список"]):
+                return format_repositories_list(repos_data)
+            else:
+                return (
+                    f"⚠️ `{project_name}` — это имя профиля GitHub, а не конкретный репозиторий.\n\n"
+                    f"{format_repositories_list(repos_data)}\n\n"
+                    f"Пожалуйста, уточни имя проекта."
+                )
+
     # Сценарий: Удаление
     if action == "delete":
+        matched_del = find_matching_repo_name(project_name)
+        if matched_del and matched_del != project_name:
+            project_name = matched_del
+
         if target_file:
             await notify(f"🗑 Удаляю файл {target_file} в репозитории {project_name}...")
             ok = await asyncio.to_thread(delete_repo_file, project_name, target_file)
@@ -327,10 +350,18 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
     # Сценарий: Модификация (MODIFIER)
     if action == "modify":
+        # Нечеткий поиск репозитория перед скачиванием
+        matched_repo = find_matching_repo_name(project_name)
+        if matched_repo and matched_repo != project_name:
+            await notify(f"🔍 Репозиторий '{project_name}' найден как '{matched_repo}' (fuzzy match)...")
+            project_name = matched_repo
+
         await notify(f"📥 Скачиваю файлы проекта {project_name}...")
         existing_files = await asyncio.to_thread(get_repo_files, project_name)
         if not existing_files:
-            return f"⚠️ Репозиторий {project_name} пуст или не найден на GitHub."
+            repos_data = await asyncio.to_thread(get_user_repositories)
+            repos_hint = format_repositories_list(repos_data)
+            return f"⚠️ Репозиторий `{project_name}` пуст или не найден на GitHub.\n\n{repos_hint}"
 
         await notify(f"⚙️ Senior Maintainer: пересобираю кодовую базу {project_name}...")
 
@@ -339,7 +370,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
         SKIP_DIRS = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.venv'}
 
         def should_skip(path: str) -> bool:
-            parts = path.replace('\\\\', '/').split('/')
+            parts = path.replace('\\', '/').split('/')
             if any(d in SKIP_DIRS for d in parts):
                 return True
             ext = '.' + path.rsplit('.', 1)[-1].lower() if '.' in path else ''
