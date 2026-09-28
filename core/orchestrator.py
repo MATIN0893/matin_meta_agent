@@ -75,19 +75,28 @@ def clean_code_snippet(code: str) -> str:
             code = "\n".join(lines[1:-1])
         elif len(lines) > 1:
             code = "\n".join(lines[1:])
-    return code
+    return code.strip()
+
+
+def extract_any_code_snippet(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    matches = re.findall(r'```(?:[a-zA-Z0-9_\-]+)?\s*\n(.*?)```', text, re.DOTALL)
+    if matches:
+        longest = max(matches, key=len).strip()
+        if len(longest) > 10:
+            return longest
+    return ""
 
 
 def extract_regex_fields(text: str) -> dict:
     result = {}
 
-    # Сканирование простых строковых полей
     for field in ["action", "project_name", "target_file", "file_path", "status"]:
         m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
         if m:
             result[field] = m.group(1).strip()
 
-    # Сканирование многострочных полей (код, план, пояснение)
     for field in ["code", "task_description", "plan", "explanation"]:
         m = re.search(rf'"{field}"\s*:\s*"(.*?)"(?=\s*,\s*"[a-zA-Z_]+"|\s*}})', text, re.DOTALL)
         if m:
@@ -95,7 +104,6 @@ def extract_regex_fields(text: str) -> dict:
             val = val.replace('\\"', '"').replace('\\\\', '\\')
             result[field] = val
 
-    # Сканирование файлов проекта
     files = {}
     files_block_match = re.search(r'"files"\s*:\s*\{(.*?)\}(?=\s*,\s*"[a-zA-Z_]+"|\s*$|\s*\})', text, re.DOTALL)
     block = files_block_match.group(1) if files_block_match else text
@@ -122,11 +130,9 @@ def safe_parse_json(text: str) -> dict:
         return {}
     cleaned = text.strip()
 
-    # 1. Очистка от markdown-тегов (```json ... ```)
     code_match = re.search(r"```(?:json|python)?\s*(.*?)\s*```", cleaned, re.DOTALL)
     candidate = code_match.group(1).strip() if code_match else cleaned
 
-    # 2. Стандартный json.loads (строгий и нестрогий режим)
     try:
         data = json.loads(candidate)
         if isinstance(data, dict):
@@ -141,7 +147,6 @@ def safe_parse_json(text: str) -> dict:
     except Exception:
         pass
 
-    # 3. Подключение json_repair (если доступен)
     if repair_json is not None:
         try:
             repaired = repair_json(candidate, return_objects=True)
@@ -154,7 +159,6 @@ def safe_parse_json(text: str) -> dict:
         except Exception:
             pass
 
-    # 4. ast.literal_eval для Python-синтаксиса
     try:
         py_cand = candidate
         py_cand = re.sub(r'\btrue\b', 'True', py_cand)
@@ -166,12 +170,10 @@ def safe_parse_json(text: str) -> dict:
     except Exception:
         pass
 
-    # 5. Прямое регулярное извлечение полей без падения
     extracted = extract_regex_fields(candidate)
     if extracted:
         return extracted
 
-    # 6. Поиск любого внешнего JSON-блока { ... }
     obj_match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
     if obj_match:
         try:
@@ -182,6 +184,84 @@ def safe_parse_json(text: str) -> dict:
             pass
 
     return {}
+
+
+def collect_project_files(parsed_data: dict, raw_text: str = "", default_target: str = "", existing_files: dict = None) -> dict:
+    """Устойчивый сборщик файлов проекта из различных вариантов ответа LLM."""
+    extracted = {}
+
+    # 1. Проверка всех возможных ключей словаря
+    if isinstance(parsed_data, dict):
+        for key in ["files", "modified_files", "updated_files", "new_files", "changed_files", "source_files", "code_files"]:
+            val = parsed_data.get(key)
+            if isinstance(val, dict):
+                for fpath, fcontent in val.items():
+                    if isinstance(fcontent, str) and fcontent.strip():
+                        extracted[fpath.strip()] = clean_code_snippet(fcontent)
+                    elif isinstance(fcontent, dict) and "content" in fcontent:
+                        extracted[fpath.strip()] = clean_code_snippet(str(fcontent["content"]))
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        fpath = item.get("path") or item.get("file_path") or item.get("filename") or item.get("name")
+                        fcontent = item.get("content") or item.get("code") or item.get("text")
+                        if fpath and fcontent and isinstance(fcontent, str):
+                            extracted[str(fpath).strip()] = clean_code_snippet(fcontent)
+
+        # 2. Одиночные поля (file_path + code)
+        if not extracted:
+            fpath = parsed_data.get("file_path") or parsed_data.get("target_file") or parsed_data.get("filename") or parsed_data.get("file")
+            code = parsed_data.get("code") or parsed_data.get("content")
+            if fpath and code and isinstance(code, str):
+                extracted[str(fpath).strip()] = clean_code_snippet(code)
+
+    # 3. Резервный парсинг markdown-блоков с именами файлов
+    if not extracted and raw_text:
+        # Паттерн 1: ```python:path/to/file.py
+        p1 = re.compile(r"""```(?:python|py|json|sh|bash)?(?::|\s+title=['"]?|\s+file=['"]?|\s+filename=['"]?|\s+path=['"]?|\s+)([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)['"]?\s*\n(.*?)```""", re.DOTALL)
+        for m in p1.finditer(raw_text):
+            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+
+        # Паттерн 2: # file: path/to/file.py внутри блока
+        p2 = re.compile(r"""```(?:[a-zA-Z0-9_\-]+)?\s*\n\s*(?:#|//|--)\s*(?:file(?:path|name)?|path):\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*\n(.*?)```""", re.DOTALL)
+        for m in p2.finditer(raw_text):
+            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+
+        # Паттерн 3: === path/to/file.py ===
+        p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===)|\Z)""", re.DOTALL)
+        for m in p3.finditer(raw_text):
+            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+
+        # Паттерн 4: ### path/to/file.py
+        p4 = re.compile(r"""#{1,4}\s*[`'"]?([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)[`'"]?\s*\n\s*```(?:[a-zA-Z0-9_\-]+)?\s*\n(.*?)```""", re.DOTALL)
+        for m in p4.finditer(raw_text):
+            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+
+    # 4. Если extracted всё ещё пуст, берем target_file или подбираем подходящий файл
+    if not extracted:
+        candidate_code = ""
+        if isinstance(parsed_data, dict):
+            candidate_code = parsed_data.get("code") or parsed_data.get("content") or ""
+        if not candidate_code and raw_text:
+            candidate_code = extract_any_code_snippet(raw_text)
+
+        if candidate_code and isinstance(candidate_code, str) and candidate_code.strip():
+            target_path = default_target
+            if not target_path and existing_files:
+                py_files = [f for f in existing_files.keys() if f.endswith(".py")]
+                if "main.py" in existing_files:
+                    target_path = "main.py"
+                elif len(py_files) == 1:
+                    target_path = py_files[0]
+                elif len(existing_files) == 1:
+                    target_path = list(existing_files.keys())[0]
+
+            if not target_path:
+                target_path = "main.py"
+
+            extracted[target_path] = clean_code_snippet(candidate_code)
+
+    return extracted
 
 
 def get_field(data, key: str, default=None):
@@ -291,13 +371,15 @@ async def run_task(prompt: str, status_cb=None) -> str:
         )
         try:
             mod_data = safe_parse_json(mod_raw)
-        except Exception as e:
-            return f"❌ Ошибка разбора модификации: {e}"
-        files = mod_data.get("files", {})
-        if not files and get_field(mod_data, "code"):
-            target_path = get_field(mod_data, "file_path") or target_file
-            if target_path:
-                files[target_path] = clean_code_snippet(mod_data["code"])
+        except Exception:
+            mod_data = {}
+
+        files = collect_project_files(
+            parsed_data=mod_data,
+            raw_text=mod_raw,
+            default_target=target_file,
+            existing_files=existing_files,
+        )
         record_brain_success()
 
     # Сценарий: Создание нового проекта (ENGINEER)
@@ -314,13 +396,15 @@ async def run_task(prompt: str, status_cb=None) -> str:
         )
         try:
             eng_data = safe_parse_json(eng_raw)
-        except Exception as e:
-            return f"❌ Ошибка разбора генерации: {e}"
-        files = eng_data.get("files", {})
-        if not files and get_field(eng_data, "code"):
-            target_path = get_field(eng_data, "file_path") or target_file
-            if target_path:
-                files[target_path] = clean_code_snippet(eng_data["code"])
+        except Exception:
+            eng_data = {}
+
+        files = collect_project_files(
+            parsed_data=eng_data,
+            raw_text=eng_raw,
+            default_target=target_file or "main.py",
+            existing_files=None,
+        )
         record_brain_success()
 
     if not files:
@@ -354,14 +438,19 @@ async def run_task(prompt: str, status_cb=None) -> str:
                     user_prompt=prompt,
                 ),
             )
-            fix_data = safe_parse_json(fix_raw)
-            fix_files = fix_data.get("files", {})
+            try:
+                fix_data = safe_parse_json(fix_raw)
+            except Exception:
+                fix_data = {}
+
+            fix_files = collect_project_files(
+                parsed_data=fix_data,
+                raw_text=fix_raw,
+                default_target=target_file,
+                existing_files=files,
+            )
             if fix_files:
-                files = fix_files
-            elif get_field(fix_data, "code"):
-                target_path = get_field(fix_data, "file_path") or target_file
-                if target_path:
-                    files[target_path] = clean_code_snippet(fix_data["code"])
+                files.update(fix_files)
         except Exception:
             pass
 
