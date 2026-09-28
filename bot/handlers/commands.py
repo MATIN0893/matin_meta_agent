@@ -1,18 +1,15 @@
 import os
 from telegram import Update
 from telegram.ext import ContextTypes
+from config.settings import is_user_allowed
 from services.github_service import list_user_repos
 from services.patrol_service import STATE, check_self_brain, ServiceState
 from services.render_service import get_services
 
-# Разрешенные ID пользователей через запятую
-raw_users = os.getenv("ALLOWED_USERS", "")
-ALLOWED_USERS = [int(u.strip()) for u in raw_users.split(",") if u.strip().isdigit()]
 
 def is_allowed(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS
+    return is_user_allowed(user_id)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -29,6 +26,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
@@ -38,7 +36,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     brain_ok = check_self_brain()
     brain_status = "🟢 В норме (LLM Router активен)" if brain_ok else "🔴 Ошибка связи с LLM"
 
-    # Получаем актуальный список сервисов
     try:
         render_list = get_services()
     except Exception:
@@ -49,7 +46,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         srv = item.get("service", {})
         name = srv.get("name", "unknown")
         runtime = STATE.get(name)
-        
+
         if not runtime or runtime.state == ServiceState.HEALTHY:
             icon = "🟢"
             state_text = "online"
@@ -59,7 +56,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             icon = "🚨"
             state_text = f"degraded ({runtime.last_error[:20]})"
-            
+
         services_lines.append(f"{icon} `{name}` — {state_text}")
 
     services_block = "\n".join(services_lines) if services_lines else "• Нет данных"
@@ -74,6 +71,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 _Автопатруль активен в фоновом режиме_"
     )
     await update.message.reply_text(status_msg, parse_mode="Markdown")
+
 
 async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id

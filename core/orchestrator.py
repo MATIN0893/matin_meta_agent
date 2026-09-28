@@ -1,4 +1,4 @@
-﻿import ast
+import ast
 import asyncio
 import inspect
 import json
@@ -31,19 +31,31 @@ except ImportError:
 
 
 def safe_parse_json(text: str) -> dict:
-    """Извлекает и парсит JSON даже при наличии markdown-разметки."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    text = text.strip()
+    """Извлекает и парсит JSON даже при наличии markdown-разметки или текста."""
+    if not text or not isinstance(text, str):
+        raise ValueError("Пустой ответ модели.")
+    cleaned = text.strip()
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except Exception:
-        match = re.search(r"(\{.*\})", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1))
-        raise
+        pass
+
+    code_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
+    if code_match:
+        block = code_match.group(1).strip()
+        try:
+            return json.loads(block)
+        except Exception:
+            pass
+
+    obj_match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group(1).strip())
+        except Exception:
+            pass
+
+    return json.loads(cleaned)
 
 
 def get_field(data, key: str, default=None):
@@ -92,7 +104,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
             ok = await asyncio.to_thread(delete_repo_file, project_name, target_file)
             return f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
         else:
-            await notify(f"🗑 Удаляю репозиторий {project_name}...")
+            await notify(f"🗑 Удаляю репозиторий {project_name}...\\\")
             ok = await asyncio.to_thread(delete_repo, project_name)
             return f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
 
@@ -112,7 +124,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
         SKIP_DIRS = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.venv'}
 
         def should_skip(path: str) -> bool:
-            parts = path.replace('\\', '/').split('/')
+            parts = path.replace('\\\\', '/').split('/')
             if any(d in SKIP_DIRS for d in parts):
                 return True
             ext = '.' + path.rsplit('.', 1)[-1].lower() if '.' in path else ''

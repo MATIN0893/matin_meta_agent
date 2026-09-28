@@ -1,11 +1,12 @@
 from telegram import Update
 from telegram.ext import ContextTypes
-from config.settings import ALLOWED_USERS
+from config.settings import is_user_allowed
 from core.orchestrator import run_task
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if str(user_id) not in str(ALLOWED_USERS):
+    if not is_user_allowed(user_id):
         return
 
     text = update.message.text.strip()
@@ -20,8 +21,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    result = await run_task(text, progress)
+    try:
+        result = await run_task(text, progress)
+    except Exception as e:
+        result = f"❌ Сбой выполнения задачи: {e}"
+
     try:
         await msg.edit_text(result, parse_mode="HTML")
     except Exception:
-        await msg.edit_text(result)
+        try:
+            await msg.edit_text(result)
+        except Exception:
+            pass
