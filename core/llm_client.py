@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import requests
 from dotenv import load_dotenv
@@ -10,18 +11,35 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# Актуальные модели Groq (после вывода из эксплуатации Llama 3 и Mixtral)
 DEFAULT_GROQ_MODELS = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+]
+
+# Актуальные модели OpenRouter:
+# openrouter/free — официальный роутер бесплатных моделей, который всегда динамически выбирает активную бесплатную модель.
+DEFAULT_OPENROUTER_MODELS = [
+    "openrouter/free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "meta-llama/llama-3.3-70b-instruct",
+    "meta-llama/llama-3.1-8b-instruct",
+    "qwen/qwen-2.5-coder-32b-instruct",
+    "openai/gpt-oss-20b",
+]
+
+DEPRECATED_MODELS = {
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "mixtral-8x7b-32768",
-]
-
-DEFAULT_OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
     "meta-llama/llama-3.1-8b-instruct:free",
     "qwen/qwen-2.5-coder-32b-instruct:free",
-]
+    "google/gemini-2.0-flash-exp:free",
+}
+
+_cached_groq_models = []
+_last_groq_fetch = 0.0
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -31,30 +49,48 @@ def _get_env(key: str, default: str = "") -> str:
     return val.strip()
 
 
+def fetch_available_groq_models(groq_key: str) -> list:
+    """Динамический опрос активных моделей Groq для учетной записи."""
+    global _cached_groq_models, _last_groq_fetch
+    now = time.time()
+    if _cached_groq_models and (now - _last_groq_fetch < 3600):
+        return _cached_groq_models
+
+    try:
+        resp = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {groq_key}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            discovered = [
+                m["id"]
+                for m in data
+                if m.get("id")
+                and m.get("id") not in DEPRECATED_MODELS
+                and not any(k in m["id"].lower() for k in ["whisper", "tts", "orpheus", "audio", "embed"])
+            ]
+            if discovered:
+                _cached_groq_models = discovered
+                _last_groq_fetch = now
+                return discovered
+    except Exception as e:
+        logger.debug(f"Не удалось получить список моделей Groq: {e}")
+
+    return DEFAULT_GROQ_MODELS
+
+
 def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -> str:
     """
     Вызывает доступную LLM модель с каскадным переключением (Groq -> OpenRouter).
-    Автоматически перебирает рабочие модели при сбоях или исчерпании лимитов.
+    Автоматически перебирает актуальные рабочие модели.
     """
     groq_key = _get_env("GROQ_API_KEY")
     openrouter_key = _get_env("OPENROUTER_API_KEY")
 
     configured_groq_model = _get_env("GROQ_MODEL")
     configured_openrouter_model = _get_env("OPENROUTER_MODEL")
-
-    groq_models = []
-    if configured_groq_model and configured_groq_model != "openai/gpt-oss-20b":
-        groq_models.append(configured_groq_model)
-    for m in DEFAULT_GROQ_MODELS:
-        if m not in groq_models:
-            groq_models.append(m)
-
-    openrouter_models = []
-    if configured_openrouter_model:
-        openrouter_models.append(configured_openrouter_model)
-    for m in DEFAULT_OPENROUTER_MODELS:
-        if m not in openrouter_models:
-            openrouter_models.append(m)
 
     errors = []
 
@@ -64,6 +100,17 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
             "Authorization": f"Bearer {groq_key}",
             "Content-Type": "application/json",
         }
+        live_groq = fetch_available_groq_models(groq_key)
+        groq_models = []
+        if configured_groq_model and configured_groq_model not in DEPRECATED_MODELS:
+            groq_models.append(configured_groq_model)
+        for m in ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]:
+            if m not in groq_models and m not in DEPRECATED_MODELS:
+                groq_models.append(m)
+        for m in live_groq:
+            if m not in groq_models and m not in DEPRECATED_MODELS:
+                groq_models.append(m)
+
         for model in groq_models:
             try:
                 payload = {
@@ -92,6 +139,13 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
             "HTTP-Referer": "https://matin-meta-agent.onrender.com",
             "X-Title": "Matin Meta Agent",
         }
+        openrouter_models = []
+        if configured_openrouter_model and configured_openrouter_model not in DEPRECATED_MODELS:
+            openrouter_models.append(configured_openrouter_model)
+        for m in DEFAULT_OPENROUTER_MODELS:
+            if m not in openrouter_models and m not in DEPRECATED_MODELS:
+                openrouter_models.append(m)
+
         for model in openrouter_models:
             try:
                 payload = {

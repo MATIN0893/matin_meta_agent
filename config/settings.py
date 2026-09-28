@@ -14,9 +14,9 @@ ADMIN_ID = TELEGRAM_ADMIN_ID
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# LLM Models
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+# LLM Models (обновлены под актуальные доступные модели)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
 # GitHub
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
