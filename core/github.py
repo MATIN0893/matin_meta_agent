@@ -17,6 +17,8 @@ from services.github_service import (
     get_repo_tree,
     get_repo_files_list,
     get_repo_file_content,
+    search_repo_files,
+    trace_execution_path,
 )
 
 __all__ = [
@@ -38,4 +40,6 @@ __all__ = [
     "get_repo_tree",
     "get_repo_files_list",
     "get_repo_file_content",
+    "search_repo_files",
+    "trace_execution_path",
 ]

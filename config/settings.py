@@ -1,34 +1,26 @@
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
 TG_BOT_TOKEN = TELEGRAM_BOT_TOKEN
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID") or os.getenv("ADMIN_ID")
 ADMIN_ID = TELEGRAM_ADMIN_ID
 
-# LLM Keys
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# LLM Models (обновлены под актуальные доступные модели)
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
-# GitHub
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
+GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "MATIN0893")
 
-# Render
 RENDER_DEPLOY_HOOK = os.getenv("RENDER_DEPLOY_HOOK")
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 
-
 def is_user_allowed(user_id: int) -> bool:
-    """Проверка доступа пользователя к боту."""
     raw = os.getenv("ALLOWED_USERS", "") or ALLOWED_USERS
     if not raw:
         return True

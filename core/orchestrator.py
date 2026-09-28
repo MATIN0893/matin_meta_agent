@@ -35,6 +35,8 @@ from services.github_service import (
     get_repo_tree,
     get_repo_files_list,
     get_repo_file_content,
+    search_repo_files,
+    trace_execution_path,
 )
 from config.settings import GITHUB_USERNAME
 from core.security import security_guard, Permission
@@ -286,6 +288,82 @@ def get_field(data, key: str, default=None):
     return default
 
 
+def classify_task_intent(prompt: str, plan_data: dict = None) -> str:
+    """
+    Разделяет задачи на категории:
+    - CODE_DIAGNOSTIC: поиск источников ошибок (429 Too Many Requests и т.д.), трассировка execution path, поиск символов/строк без изменения кода.
+    - REPOSITORY_INSPECTION: показать структуру/метаданные/дерево файлов без глубокой диагностики.
+    - CODE_MODIFICATION: изменение кодовой базы и коммит в GitHub.
+    - PROJECT_GENERATION: создание проекта с нуля.
+    - DELETE: удаление проекта/файла.
+    - LIST_REPOS: запрос списка репозиториев.
+    """
+    if not prompt or not isinstance(prompt, str):
+        return "CODE_DIAGNOSTIC"
+
+    prompt_lower = prompt.lower()
+    plan_action = (plan_data.get("action", "") if isinstance(plan_data, dict) else "") or ""
+    plan_action = plan_action.lower()
+    plan_type = (plan_data.get("task_type", "") if isinstance(plan_data, dict) else "") or ""
+    plan_type = plan_type.upper()
+
+    # 1. Список всех репозиториев
+    if is_repo_list_intent(prompt) or plan_type == "LIST_REPOS" or plan_action == "list":
+        return "LIST_REPOS"
+
+    # 2. Удаление
+    if re.search(r"^(?:удали|удалить)\s+(?:репозиторий|проект|файл)", prompt_lower, re.I) or plan_type == "DELETE" or plan_action == "delete":
+        return "DELETE"
+
+    # 3. Признаки модификации
+    write_keywords = [
+        "измени", "исправь", "перепиши", "добавь", "создай", "сгенерируй",
+        "закоммить", "пуш", "modify", "fix", "update", "create", "patch",
+        "write", "commit", "push"
+    ]
+    no_modify_keywords = [
+        "ничего не изменяй", "без изменений", "не изменяй", "не меняй", "read-only",
+        "только найди", "только диагностика", "только анализ", "do not modify",
+        "dont modify", "don't modify", "no changes"
+    ]
+
+    explicit_no_modify = any(k in prompt_lower for k in no_modify_keywords)
+    has_write = any(k in prompt_lower for k in write_keywords) and not explicit_no_modify
+
+    # 4. Признаки диагностики
+    diagnostic_keywords = [
+        "источник ошибки", "ошибка", "ошибки", "429", "too many requests",
+        "найди", "упоминани", "почему", "проследи", "трассируй", "трассировк",
+        "trace", "search", "диагностик", "debug", "дебаг", "баг", "проблема",
+        "execution path", "стек вызовов", "где вызывается", "openrouter",
+        "groq", "fallback", "retry", "где", "как устроен"
+    ]
+    has_diagnostic = any(k in prompt_lower for k in diagnostic_keywords)
+
+    # 5. Признаки простой инспекции структуры/файлов
+    inspection_keywords = [
+        "структура", "какие файлы", "список файлов", "инспекция",
+        "покажи репозиторий", "обзор проекта", "обзор репозитория"
+    ]
+    has_inspection = any(k in prompt_lower for k in inspection_keywords)
+
+    if plan_type == "CODE_DIAGNOSTIC" or plan_action in ("diagnostic", "debug", "trace") or (has_diagnostic and not has_write):
+        return "CODE_DIAGNOSTIC"
+
+    if has_write:
+        return "PROJECT_GENERATION" if ("создай" in prompt_lower or plan_type == "PROJECT_GENERATION") else "CODE_MODIFICATION"
+
+    if plan_type == "REPOSITORY_INSPECTION" or plan_action in ("inspect", "inspection") or has_inspection:
+        return "REPOSITORY_INSPECTION"
+
+    if explicit_no_modify or not has_write:
+        if any(q in prompt_lower for q in ["как", "что", "где", "почему", "найди"]):
+            return "CODE_DIAGNOSTIC"
+        return "REPOSITORY_INSPECTION"
+
+    return "CODE_MODIFICATION"
+
+
 async def run_task(prompt: str, status_cb=None) -> str:
     task = task_engine.create_task(user_id=0, command=prompt)
 
@@ -387,34 +465,45 @@ async def run_task(prompt: str, status_cb=None) -> str:
         return res
 
     # -------------------------------------------------------------
-    # READ-ONLY PIPELINE: инспекция, просмотр структуры или файла
-    # БЕЗ модификации, БЕЗ сохранения и БЕЗ пуша в GitHub!
+    # TASK INTENT CLASSIFICATION:
+    # REPOSITORY_INSPECTION | CODE_DIAGNOSTIC | CODE_MODIFICATION
     # -------------------------------------------------------------
-    prompt_lower = prompt.lower()
-    has_read_keywords = any(kw in prompt_lower for kw in [
-        "проверь", "прочитай", "покажи", "инспекция", "аудит", "анализ",
-        "что делает", "структура", "исследуй", "опиши", "read", "inspect",
-        "check", "view", "examine", "status"
-    ])
-    has_write_keywords = any(kw in prompt_lower for kw in [
-        "измени", "исправь", "перепиши", "добавь", "удали", "создай", "сгенерируй",
-        "закоммить", "пуш", "modify", "fix", "update", "create", "delete",
-        "write", "commit", "push", "patch"
-    ])
+    task_type = classify_task_intent(prompt, plan)
+    task.plan["task_type"] = task_type
+    task.plan["original_intent"] = prompt
+    task.log_action("classified", details=f"task_type={task_type} project={project_name}")
 
-    is_read_action = action in ("read", "inspect", "check", "view", "analyze", "info", "get", "status", "audit")
-    is_read_only = is_read_action or (has_read_keywords and not has_write_keywords)
+    matched_repo = github_service.find_matching_repo_name(project_name)
+    if matched_repo and matched_repo != project_name:
+        await notify(f"🔍 Репозиторий '{project_name}' определен как '{matched_repo}' (fuzzy match)...")
+        project_name = matched_repo
 
-    if is_read_only:
+    # =============================================================
+    # PIPELINE: CODE_DIAGNOSTIC
+    # UNDERSTAND -> REPOSITORY_CONTEXT -> READ_FILES -> SEARCH -> TRACE -> ANALYZE -> REPORT
+    # FORBIDDEN: MODIFY, COMMIT, PUSH
+    # =============================================================
+    if task_type == "CODE_DIAGNOSTIC":
         task_engine.update_state(task.task_id, TaskState.EXECUTING)
-        matched_repo = github_service.find_matching_repo_name(project_name)
-        if matched_repo and matched_repo != project_name:
-            await notify(f"🔍 Репозиторий '{project_name}' определен как '{matched_repo}' (fuzzy match)...")
-            project_name = matched_repo
 
-        await notify(f"🔍 Инспектирую репозиторий {project_name} (READ-ONLY)...")
+        # 1. UNDERSTAND: Сохраняем исходный user intent
+        task.log_action("understand", details=f"Original intent preserved: '{prompt}'")
+        await notify("🧠 **[1/6 UNDERSTAND]** Фиксирую цель диагностики и ограничения (READ-ONLY, без изменений кода)...")
 
-        # 1. Получение метаданных
+        # Формируем список поисковых запросов
+        search_terms = plan.get("search_queries") or []
+        if not isinstance(search_terms, list):
+            search_terms = []
+        for kw in ["429", "too many requests", "openrouter", "api/v1/chat/completions", "groq", "fallback", "retry", "ratelimit", "rate_limit"]:
+            if kw.lower() in prompt.lower() and kw not in search_terms:
+                search_terms.append(kw)
+        if not search_terms:
+            search_terms = ["429", "openrouter", "groq", "fallback", "retry"]
+
+        # 2. REPOSITORY_CONTEXT: Метаданные и структура
+        task.log_action("repository_context", details=f"Fetching context for {project_name}")
+        await notify(f"📁 **[2/6 REPOSITORY_CONTEXT]** Получаю контекст репозитория {project_name}...")
+
         meta = await asyncio.to_thread(github_service.get_repo_metadata, project_name)
         if not meta.get("success"):
             err_code = meta.get("status_code", 0)
@@ -437,7 +526,110 @@ async def run_task(prompt: str, status_cb=None) -> str:
         is_priv = meta.get("private", False)
         vis_icon = "🔒 Приватный" if is_priv else "🌐 Публичный"
 
-        # 2. Если запрошен конкретный файл
+        tree_info = await asyncio.to_thread(github_service.get_repo_tree, project_name, default_branch)
+        file_list = tree_info.get("files", []) if tree_info.get("success") else await asyncio.to_thread(github_service.get_repo_files_list, project_name, default_branch)
+
+        # 3. READ_FILES: Чтение файлов кодовой базы
+        task.log_action("read_files", details=f"Reading files from branch '{default_branch}' ({len(file_list)} files)")
+        await notify(f"📥 **[3/6 READ_FILES]** Загружаю файлы кодовой базы для анализа ({len(file_list)} файлов)...")
+
+        repo_files = await asyncio.to_thread(github_service.get_repo_files, project_name, default_branch, 50)
+
+        # 4. SEARCH: Поиск ключевых символов, кодов ошибок, API URL
+        task.log_action("search", details=f"Searching terms: {search_terms}")
+        await notify(f"🔍 **[4/6 SEARCH]** Сканирую кодовую базу на упоминания: {', '.join(search_terms[:6])}...")
+
+        search_results = github_service.search_repo_files(repo_files, search_terms)
+
+        # 5. TRACE: Трассировка execution path
+        task.log_action("trace", details="Tracing execution path: Telegram -> Handler -> LLM Client -> Response")
+        await notify("🔗 **[5/6 TRACE]** Трассировка execution path: Telegram → Handler → LLM Client → Error Handling...")
+
+        trace_info = github_service.trace_execution_path(repo_files)
+
+        # 6. ANALYZE: Глубокий инженерный анализ причин
+        task.log_action("analyze", details="Analyzing root cause and synthesis")
+        await notify("🔬 **[6/6 ANALYZE]** Формирую глубокое инженерное заключение...")
+
+        matches_md = []
+        for m in search_results[:30]:
+            matches_md.append(f"• `{m['file']}:{m['line']}` [{m['query']}]: `{m['code']}`")
+        matches_text = "\n".join(matches_md) if matches_md else "Прямых текстовых совпадений по списку запросов не найдено."
+
+        diagnostic_prompt = (
+            "Ты — Senior SRE & Lead Software Architect в MATIN META OS.\n"
+            f"Задача пользователя: {prompt}\n\n"
+            f"Репозиторий: {project_name} (ветка: {default_branch}, доступ: {vis_icon})\n\n"
+            f"ФАКТИЧЕСКИЕ НАЙДЕННЫЕ СОВПАДЕНИЯ В КОДЕ:\n{matches_text}\n\n"
+            f"АРХИТЕКТУРНЫЕ СВЯЗИ В КОДЕ (TRACE):\n"
+            f"- Telegram Entrypoint: {json.dumps(trace_info.get('telegram_entrypoint', []), ensure_ascii=False)}\n"
+            f"- Handlers: {json.dumps(trace_info.get('handlers', []), ensure_ascii=False)}\n"
+            f"- LLM вызовы: {json.dumps(trace_info.get('llm_calls', []), ensure_ascii=False)}\n"
+            f"- OpenRouter упоминания: {json.dumps(trace_info.get('openrouter_mentions', []), ensure_ascii=False)}\n"
+            f"- Groq упоминания: {json.dumps(trace_info.get('groq_mentions', []), ensure_ascii=False)}\n"
+            f"- Обработчики Rate Limit (429): {json.dumps(trace_info.get('rate_limit_handlers', []), ensure_ascii=False)}\n\n"
+            "СОДЕРЖИМОЕ КЛЮЧЕВЫХ ФАЙЛОВ:\n"
+            + "\n\n".join([f"=== {f} ===\n{c[:2500]}" for f, c in repo_files.items() if any(k in f.lower() for k in ["ai", "bot", "main", "config"])])
+            + "\n\n"
+            "Составь подробный, точный и структурированный инженерный отчет:\n"
+            "1. 🎯 Цель диагностики\n"
+            "2. 📍 Точный источник ошибки 429 и найденные упоминания (файлы, номера строк, точные фрагменты кода)\n"
+            "3. 🔄 Execution Path (пошаговая цепочка: от получения сообщения в Telegram через Handler к вызову LLM и обработке ответа)\n"
+            "4. ⚠️ Первопричина ошибки 429 (Too Many Requests)\n"
+            "5. 💡 Архитектурные рекомендации по устранению (retry, fallback, backoff) БЕЗ изменения кода\n"
+            "6. 🔒 Статус: READ-ONLY (изменения в кодовую базу не вносились)."
+        )
+
+        ai_report = await asyncio.to_thread(
+            ask,
+            "Ты элитный SRE инженер MATIN META. Отвечай строго профессионально, опираясь только на реальный код репозитория.",
+            diagnostic_prompt,
+        )
+
+        # 7. REPORT: Финальный отчет
+        task.log_action("report", details="Diagnostic report delivered")
+
+        final_msg = (
+            f"🔍 **ИНЖЕНЕРНАЯ ДИАГНОСТИКА: [{project_name}]({repo_url})**\n\n"
+            f"{ai_report.strip()}\n\n"
+            "────────────────────────────────────────\n"
+            "🛡 **Режим безопасности:** `READ-ONLY (CODE_DIAGNOSTIC)`\n"
+            "🚫 **Действия `MODIFY`, `COMMIT`, `PUSH` строго заблокированы.**"
+        )
+        task_engine.update_state(task.task_id, TaskState.COMPLETED, result=final_msg)
+        return final_msg
+
+    # =============================================================
+    # PIPELINE: REPOSITORY_INSPECTION
+    # Показать структуру/метаданные репозитория или файл БЕЗ изменений
+    # =============================================================
+    if task_type == "REPOSITORY_INSPECTION":
+        task_engine.update_state(task.task_id, TaskState.EXECUTING)
+        task.log_action("inspection", details=f"Inspecting repository structure for {project_name}")
+        await notify(f"🔍 Инспектирую репозиторий {project_name} (READ-ONLY)...")
+
+        meta = await asyncio.to_thread(github_service.get_repo_metadata, project_name)
+        if not meta.get("success"):
+            err_code = meta.get("status_code", 0)
+            err_msg = meta.get("error", "Неизвестная ошибка")
+            endpoint = meta.get("endpoint", f"https://api.github.com/repos/{project_name}")
+            repos_data = await asyncio.to_thread(github_service.get_user_repositories)
+            repos_hint = format_repositories_list(repos_data)
+            diag = (
+                f"❌ **Ошибка доступа к репозиторию `{project_name}`**\n\n"
+                f"• **HTTP Status:** `{err_code}`\n"
+                f"• **Endpoint:** `{endpoint}`\n"
+                f"• **Причина:** {err_msg}\n\n"
+                f"{repos_hint}"
+            )
+            task_engine.update_state(task.task_id, TaskState.FAILED, error=diag)
+            return diag
+
+        default_branch = meta.get("default_branch", "main")
+        repo_url = meta.get("html_url", f"https://github.com/MATIN0893/{project_name}")
+        is_priv = meta.get("private", False)
+        vis_icon = "🔒 Приватный" if is_priv else "🌐 Публичный"
+
         if target_file:
             await notify(f"📄 Читаю файл `{target_file}` из ветки `{default_branch}`...")
             file_res = await asyncio.to_thread(github_service.get_repo_file_content, project_name, target_file, default_branch)
@@ -466,7 +658,6 @@ async def run_task(prompt: str, status_cb=None) -> str:
                 task_engine.update_state(task.task_id, TaskState.FAILED, error=err_ans)
                 return err_ans
 
-        # 3. Инспекция всего репозитория (структура + стек + обзор)
         await notify(f"📁 Получаю дерево файлов ветки `{default_branch}`...")
         tree_info = await asyncio.to_thread(github_service.get_repo_tree, project_name, default_branch)
         file_list = tree_info.get("files", []) if tree_info.get("success") else await asyncio.to_thread(github_service.get_repo_files_list, project_name, default_branch)
@@ -510,6 +701,10 @@ async def run_task(prompt: str, status_cb=None) -> str:
         task_engine.update_state(task.task_id, TaskState.COMPLETED, result=report_msg)
         return report_msg
 
+    # =============================================================
+    # PIPELINE: CODE_MODIFICATION / PROJECT_GENERATION
+    # Изменение кодовой базы с ревью и деплоем
+    # =============================================================
     files = {}
     task_engine.update_state(task.task_id, TaskState.EXECUTING)
 

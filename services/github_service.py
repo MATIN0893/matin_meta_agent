@@ -407,7 +407,7 @@ def get_user_repositories() -> list:
             else:
                 break
     except Exception as e:
-        print(f"[GitHub] Ошибка при запросе /user/repos: {e}")
+        pass
 
     # 2. Если пусто и указан GITHUB_USERNAME, опрашиваем /users/{owner}/repos
     owner = GITHUB_USERNAME or "MATIN0893"
@@ -440,7 +440,7 @@ def get_user_repositories() -> list:
                 else:
                     break
         except Exception as e:
-            print(f"[GitHub] Ошибка при запросе /users/{owner}/repos: {e}")
+            pass
 
     # 3. Fallback на PyGithub
     if not repos and Github is not None and GITHUB_TOKEN:
@@ -459,7 +459,7 @@ def get_user_repositories() -> list:
                         description=getattr(r, "description", "") or ""
                     ))
         except Exception as e:
-            print(f"[GitHub] Ошибка PyGithub fallback: {e}")
+            pass
 
     return repos
 
@@ -550,20 +550,97 @@ def format_repositories_list(repos: list) -> str:
 
 
 def is_repo_list_intent(prompt: str) -> bool:
-    """Определяет, запрашивает ли пользователь список репозиториев."""
+    """Определяет, запрашивает ли пользователь список ВСЕХ репозиториев (а не конкретный проект или инспекцию/диагностику)."""
     if not prompt or not isinstance(prompt, str):
         return False
     text = prompt.strip().lower()
+
+    excluded_markers = [
+        ".py", ".json", ".yaml", ".yml", "matin-agent", "matin_meta_agent",
+        "faina", "429", "ошибк", "структур", "упоминани", "проследи",
+        "трассировк", "openrouter", "groq", "код", "code", "файл", "file"
+    ]
+    if any(m in text for m in excluded_markers):
+        return False
+
     patterns = [
-        r"^(список\s+репозиториев|покажи\s+репозитории|какие\s+репозитории|мои\s+репозитории|репозитории|repos|list\s+repos)$",
-        r"(список|покажи|выведи|глянь|найди)\s+.*(репозитори|проектов|реп)",
-        r"(какие\s+(есть\s+)?(репозитории|проекты))",
-        r"(дай|выдай)\s+список\s+(репозиториев|проектов)",
+        r"^(?:список\s+репозиториев|покажи\s+(?:все\s+)?репозитории|какие\s+(?:у\s+меня\s+)?(?:есть\s+)?репозитории|мои\s+репозитории|репозитории|repos|list\s+repos)$",
+        r"^(?:список|покажи|выведи)\s+(?:все\s+)?(?:мои\s+)?(?:репозитории|проекты)$",
+        r"^(?:дай|выдай)\s+список\s+(?:репозиториев|проектов)$",
     ]
     for p in patterns:
         if re.search(p, text):
             return True
     return False
+
+
+def search_repo_files(repo_files: dict, queries: list) -> list:
+    """Ищет ключевые строки, токены и регулярные выражения по кодовой базе репозитория."""
+    matches = []
+    if not repo_files or not queries:
+        return matches
+
+    clean_queries = [str(q).strip() for q in queries if str(q).strip()]
+
+    for fpath, content in repo_files.items():
+        if not isinstance(content, str):
+            continue
+        lines = content.splitlines()
+        for idx, line in enumerate(lines, 1):
+            line_str = line.strip()
+            line_lower = line.lower()
+            for q in clean_queries:
+                if q.lower() in line_lower:
+                    matches.append({
+                        "file": fpath,
+                        "line": idx,
+                        "query": q,
+                        "code": line_str
+                    })
+    return matches
+
+
+def trace_execution_path(repo_files: dict) -> dict:
+    """Анализирует архитектурные связи: Telegram setup -> Handlers -> LLM client -> Error/RateLimit Handling."""
+    trace = {
+        "telegram_entrypoint": [],
+        "handlers": [],
+        "llm_calls": [],
+        "openrouter_mentions": [],
+        "groq_mentions": [],
+        "rate_limit_handlers": [],
+        "error_handling": []
+    }
+
+    for fpath, content in repo_files.items():
+        if not isinstance(content, str):
+            continue
+        lines = content.splitlines()
+        for idx, line in enumerate(lines, 1):
+            line_str = line.strip()
+
+            if any(k in line_str for k in ["ApplicationBuilder", "Application.builder", "app = FastAPI", "lifespan"]):
+                trace["telegram_entrypoint"].append({"file": fpath, "line": idx, "code": line_str})
+
+            if any(k in line_str for k in ["CommandHandler", "MessageHandler", "CallbackQueryHandler", "def code_command", "def run_command", "def plan_task"]):
+                trace["handlers"].append({"file": fpath, "line": idx, "code": line_str})
+
+            if any(k in line_str for k in ["OPENROUTER_URL", "openrouter.ai", "chat.completions.create", "client.post", "ask(", "generate_code"]):
+                trace["llm_calls"].append({"file": fpath, "line": idx, "code": line_str})
+
+            if any(k in line_str for k in ["openrouter", "OPENROUTER_URL", "openrouter_model"]):
+                trace["openrouter_mentions"].append({"file": fpath, "line": idx, "code": line_str})
+
+            if any(k in line_str for k in ["Groq", "groq_client", "GROQ_API_KEY"]):
+                trace["groq_mentions"].append({"file": fpath, "line": idx, "code": line_str})
+
+            if any(k in line_str for k in ["429", "status_code == 429", "status_code in {408, 429", "_retry_after_seconds", "RateLimitError", "retry"]):
+                trace["rate_limit_handlers"].append({"file": fpath, "line": idx, "code": line_str})
+
+            if any(k in line_str for k in ["except Exception", "except (httpx.", "raise_for_status", "logger.warning", "logger.exception"]):
+                trace["error_handling"].append({"file": fpath, "line": idx, "code": line_str})
+
+    return trace
 
 
 def list_user_repos() -> list:

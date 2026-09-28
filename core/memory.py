@@ -75,6 +75,9 @@ class EngineeringMemory:
             self.data["deployments"] = self.data["deployments"][-200:]
         self.save()
 
+    def record_bug(self, project: str, error: str = "", patch: str = "", status: str = "resolved"):
+        return self.record_bug_fix(project=project, error_text=error, root_cause=status, fix_description=patch)
+
     def record_bug_fix(self, project: str, error_text: str, root_cause: str, fix_description: str, confidence: float = 1.0):
         entry = {
             "timestamp": time.time(),
