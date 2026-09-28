@@ -1,6 +1,7 @@
 import os
 import re
 import difflib
+import base64
 import requests
 from config.settings import GITHUB_TOKEN, GITHUB_USERNAME
 
@@ -73,6 +74,16 @@ def get_github_client():
     return Github(GITHUB_TOKEN)
 
 
+def _get_auth_headers(accept: str = "application/vnd.github.v3+json") -> dict:
+    headers = {
+        "Accept": accept,
+        "User-Agent": "Matin-Meta-Agent"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    return headers
+
+
 def check_repo_exists(repo_name: str) -> dict:
     """
     Проверяет реальный GitHub API endpoint: https://api.github.com/repos/{owner}/{repo}.
@@ -83,21 +94,11 @@ def check_repo_exists(repo_name: str) -> dict:
 
     owner = GITHUB_USERNAME or "MATIN0893"
     target = repo_name.strip()
-    if "/" in target:
-        full_name = target
-    else:
-        full_name = f"{owner}/{target}"
-
+    full_name = target if "/" in target else f"{owner}/{target}"
     url = f"https://api.github.com/repos/{full_name}"
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "Matin-Meta-Agent"
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=_get_auth_headers(), timeout=10)
         if resp.status_code == 200:
             return {"exists": True, "status_code": 200, "full_name": full_name, "message": "OK"}
         elif resp.status_code == 404:
@@ -118,18 +119,256 @@ def check_repo_exists(repo_name: str) -> dict:
         return {"exists": False, "status_code": 0, "full_name": full_name, "message": str(e)}
 
 
+def get_repo_metadata(repo_name: str) -> dict:
+    """
+    READ-ONLY: Получает полные метаданные репозитория:
+    имя, полное имя, ветка по умолчанию, приватность, описание, html_url,
+    с четкой диагностикой статуса и эндпоинта без вывода секретов.
+    """
+    if not repo_name:
+        return {
+            "success": False,
+            "status_code": 400,
+            "error": "Имя репозитория пустое",
+            "repository": "",
+            "endpoint": ""
+        }
+
+    owner = GITHUB_USERNAME or "MATIN0893"
+    target = repo_name.strip()
+    full_name = target if "/" in target else f"{owner}/{target}"
+    endpoint = f"https://api.github.com/repos/{full_name}"
+
+    try:
+        resp = requests.get(endpoint, headers=_get_auth_headers(), timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                "success": True,
+                "name": data.get("name", target.split("/")[-1]),
+                "full_name": data.get("full_name", full_name),
+                "default_branch": data.get("default_branch", "main"),
+                "private": data.get("private", False),
+                "description": data.get("description") or "",
+                "html_url": data.get("html_url") or f"https://github.com/{full_name}",
+                "status_code": 200,
+                "endpoint": endpoint,
+                "repository": full_name
+            }
+        elif resp.status_code == 404:
+            return {
+                "success": False,
+                "status_code": 404,
+                "error": f"Репозиторий '{full_name}' не найден (HTTP 404 Not Found).",
+                "endpoint": endpoint,
+                "repository": full_name
+            }
+        elif resp.status_code in (401, 403):
+            err_reason = "Неверный или просроченный токен (401)" if resp.status_code == 401 else "Ограничение доступа или лимит запросов GitHub (403)"
+            return {
+                "success": False,
+                "status_code": resp.status_code,
+                "error": err_reason,
+                "endpoint": endpoint,
+                "repository": full_name
+            }
+        else:
+            return {
+                "success": False,
+                "status_code": resp.status_code,
+                "error": f"GitHub API вернул статус HTTP {resp.status_code}",
+                "endpoint": endpoint,
+                "repository": full_name
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "status_code": 0,
+            "error": f"Сетевая ошибка обращения к GitHub API: {e}",
+            "endpoint": endpoint,
+            "repository": full_name
+        }
+
+
+def get_repo_tree(repo_name: str, branch: str = None) -> dict:
+    """
+    READ-ONLY: Получает дерево файлов репозитория через Git Trees API.
+    Корректно работает для любой ветки (main/master) и приватных репозиториев.
+    """
+    meta = get_repo_metadata(repo_name)
+    if not meta.get("success"):
+        return meta
+
+    full_name = meta.get("full_name") or repo_name.strip()
+    target_branch = branch or meta.get("default_branch") or "main"
+    endpoint = f"https://api.github.com/repos/{full_name}/git/trees/{target_branch}?recursive=1"
+
+    try:
+        resp = requests.get(endpoint, headers=_get_auth_headers(), timeout=15)
+        if resp.status_code == 200:
+            tree_data = resp.json().get("tree", [])
+            files = []
+            dirs = []
+            for item in tree_data:
+                path = item.get("path", "")
+                parts = path.replace("\\", "/").split("/")
+                if any(d in IGNORE_DIRS for d in parts):
+                    continue
+                if item.get("type") == "blob":
+                    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+                    if ext not in IGNORE_EXTENSIONS:
+                        files.append(path)
+                elif item.get("type") == "tree":
+                    dirs.append(path)
+
+            return {
+                "success": True,
+                "status_code": 200,
+                "endpoint": endpoint,
+                "repository": full_name,
+                "branch": target_branch,
+                "tree": tree_data,
+                "files": files,
+                "directories": dirs,
+                "truncated": resp.json().get("truncated", False)
+            }
+        else:
+            return {
+                "success": False,
+                "status_code": resp.status_code,
+                "endpoint": endpoint,
+                "repository": full_name,
+                "branch": target_branch,
+                "error": f"Не удалось получить git tree (HTTP {resp.status_code}) для ветки '{target_branch}'"
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "status_code": 0,
+            "endpoint": endpoint,
+            "repository": full_name,
+            "branch": target_branch,
+            "error": f"Сетевая ошибка при получении git tree: {e}"
+        }
+
+
+def get_repo_files_list(repo_name: str, branch: str = None) -> list:
+    """READ-ONLY: Возвращает список относительных путей файлов репозитория."""
+    tree_res = get_repo_tree(repo_name, branch=branch)
+    if tree_res.get("success"):
+        return tree_res.get("files", [])
+    files = get_repo_files(repo_name, branch=branch)
+    return list(files.keys()) if files else []
+
+
+def get_repo_file_content(repo_name: str, file_path: str, branch: str = None) -> dict:
+    """
+    READ-ONLY: Читает содержимое конкретного файла из репозитория GitHub.
+    Использует корректные заголовки авторизации, поддерживает приватные репозитории
+    и автоматически декодирует raw/base64 контент.
+    """
+    if not repo_name or not file_path:
+        return {
+            "success": False,
+            "status_code": 400,
+            "error": "Имя репозитория или путь к файлу не заданы",
+            "repository": repo_name or "",
+            "endpoint": ""
+        }
+
+    owner = GITHUB_USERNAME or "MATIN0893"
+    target = repo_name.strip()
+    full_name = target if "/" in target else f"{owner}/{target}"
+    clean_path = file_path.strip().lstrip("/")
+
+    target_branch = branch
+    if not target_branch:
+        meta = get_repo_metadata(full_name)
+        target_branch = meta.get("default_branch") if meta.get("success") else "main"
+
+    endpoint = f"https://api.github.com/repos/{full_name}/contents/{clean_path}"
+    params = {"ref": target_branch}
+
+    try:
+        # 1. Попытка получить через raw заголовок
+        resp = requests.get(endpoint, headers=_get_auth_headers(accept="application/vnd.github.v3.raw"), params=params, timeout=12)
+        if resp.status_code == 200:
+            return {
+                "success": True,
+                "status_code": 200,
+                "content": resp.text,
+                "path": clean_path,
+                "repository": full_name,
+                "branch": target_branch,
+                "endpoint": endpoint
+            }
+        elif resp.status_code == 404:
+            return {
+                "success": False,
+                "status_code": 404,
+                "error": f"Файл '{clean_path}' не найден в ветке '{target_branch}' репозитория '{full_name}' (HTTP 404 Not Found)",
+                "path": clean_path,
+                "repository": full_name,
+                "branch": target_branch,
+                "endpoint": endpoint
+            }
+        
+        # 2. Если raw не поддержан, запрашиваем обычный JSON и декодируем base64
+        resp_json = requests.get(endpoint, headers=_get_auth_headers(), params=params, timeout=12)
+        if resp_json.status_code == 200:
+            jdata = resp_json.json()
+            if isinstance(jdata, dict) and "content" in jdata and jdata.get("encoding") == "base64":
+                raw_bytes = base64.b64decode(jdata["content"])
+                text_content = raw_bytes.decode("utf-8", errors="ignore")
+                return {
+                    "success": True,
+                    "status_code": 200,
+                    "content": text_content,
+                    "path": clean_path,
+                    "repository": full_name,
+                    "branch": target_branch,
+                    "endpoint": endpoint
+                }
+            elif isinstance(jdata, dict) and "download_url" in jdata and jdata["download_url"]:
+                fresp = requests.get(jdata["download_url"], headers=_get_auth_headers(), timeout=12)
+                if fresp.status_code == 200:
+                    return {
+                        "success": True,
+                        "status_code": 200,
+                        "content": fresp.text,
+                        "path": clean_path,
+                        "repository": full_name,
+                        "branch": target_branch,
+                        "endpoint": endpoint
+                    }
+
+        return {
+            "success": False,
+            "status_code": resp.status_code,
+            "error": f"GitHub API вернул статус HTTP {resp.status_code}",
+            "path": clean_path,
+            "repository": full_name,
+            "branch": target_branch,
+            "endpoint": endpoint
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "status_code": 0,
+            "error": f"Сетевая ошибка при чтении файла: {e}",
+            "path": clean_path,
+            "repository": full_name,
+            "branch": target_branch,
+            "endpoint": endpoint
+        }
+
+
 def get_user_repositories() -> list:
     """
     Делает GET к https://api.github.com/user/repos (или /users/{owner}/repos)
     с заголовками авторизации по GITHUB_TOKEN.
     """
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "Matin-Meta-Agent"
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-
+    headers = _get_auth_headers()
     repos = []
     seen = set()
 
@@ -164,7 +403,6 @@ def get_user_repositories() -> list:
                 else:
                     break
             elif resp.status_code == 404:
-                print(f"[GitHub] Запрос /user/repos вернул HTTP 404 (endpoint недоступен)")
                 break
             else:
                 break
@@ -205,7 +443,7 @@ def get_user_repositories() -> list:
             print(f"[GitHub] Ошибка при запросе /users/{owner}/repos: {e}")
 
     # 3. Fallback на PyGithub
-    if not repos and Github is not None:
+    if not repos and Github is not None and GITHUB_TOKEN:
         try:
             gh = get_github_client()
             user = gh.get_user()
@@ -335,133 +573,106 @@ def list_user_repos() -> list:
     return []
 
 
-def get_repo_files(repo_name: str) -> dict:
-    if Github is None:
-        # Fallback на REST API
-        return _get_repo_files_rest(repo_name)
-
-    try:
-        gh = get_github_client()
-        user = None
-        try:
-            user = gh.get_user()
-        except Exception:
-            pass
-
-        repo = None
-        target_clean = repo_name.strip()
-
-        # 1. Полноформатное имя 'owner/repo'
-        if "/" in target_clean:
-            try:
-                repo = gh.get_repo(target_clean)
-            except Exception:
-                pass
-
-        # 2. Попытка через get_user().get_repo()
-        if repo is None and user:
-            try:
-                repo = user.get_repo(target_clean)
-            except Exception:
-                pass
-
-        # 3. Попытка через GITHUB_USERNAME/{repo}
-        if repo is None:
-            owner = GITHUB_USERNAME or (user.login if user else "MATIN0893")
-            try:
-                repo = gh.get_repo(f"{owner}/{target_clean}")
-            except Exception:
-                pass
-
-        # 4. Нечеткий поиск, если напрямую не найден (404)
-        if repo is None:
-            matched = find_matching_repo(target_clean)
-            if matched and matched.get("name") != target_clean:
-                actual_name = matched.get("name")
-                print(f"[GitHub] Репозиторий '{target_clean}' не найден напрямую. Найден по нечеткому совпадению: '{actual_name}'")
-                if user:
-                    try:
-                        repo = user.get_repo(actual_name)
-                    except Exception:
-                        pass
-                if repo is None:
-                    owner = GITHUB_USERNAME or (user.login if user else "MATIN0893")
-                    try:
-                        repo = gh.get_repo(f"{owner}/{actual_name}")
-                    except Exception:
-                        pass
-
-        if repo is None:
-            check = check_repo_exists(target_clean)
-            print(f"[GitHub] Ошибка обращения к '{target_clean}': {check.get('message')}")
-            return {}
-
+def get_repo_files(repo_name: str, branch: str = None, max_files: int = 50, max_size_bytes: int = MAX_FILE_SIZE_BYTES) -> dict:
+    """
+    Загружает файлы репозитория в память:
+    1. Через Git Trees API (быстро, 1 запрос на дерево + чтение содержимого с auth-заголовками)
+    2. Fallback на PyGithub
+    3. Fallback на REST API с авторизацией
+    """
+    # 1. Быстрый и надежный способ через Git Trees API
+    tree_res = get_repo_tree(repo_name, branch=branch)
+    if tree_res.get("success") and tree_res.get("files"):
+        target_branch = tree_res.get("branch", "main")
+        file_candidates = tree_res["files"][:max_files]
         files_dict = {}
+        for fpath in file_candidates:
+            c_res = get_repo_file_content(repo_name, fpath, branch=target_branch)
+            if c_res.get("success") and len(c_res.get("content", "")) <= max_size_bytes:
+                files_dict[fpath] = c_res["content"]
+        if files_dict:
+            return files_dict
 
-        def fetch_recursive(path=""):
-            try:
-                contents = repo.get_contents(path)
-            except Exception:
-                return
+    # 2. PyGithub способ
+    if Github is not None and GITHUB_TOKEN:
+        try:
+            gh = get_github_client()
+            owner = GITHUB_USERNAME or "MATIN0893"
+            target = repo_name.strip()
+            full_name = target if "/" in target else f"{owner}/{target}"
+            repo = gh.get_repo(full_name)
+            target_branch = branch or getattr(repo, "default_branch", "main") or "main"
 
-            if not isinstance(contents, list):
-                contents = [contents]
+            files_dict = {}
 
-            for item in contents:
-                if item.type == "dir":
-                    if item.name.lower() in IGNORE_DIRS:
-                        continue
-                    fetch_recursive(item.path)
-                elif item.type == "file":
-                    name_lower = item.name.lower()
-                    _, ext = os.path.splitext(name_lower)
+            def fetch_recursive(path=""):
+                if len(files_dict) >= max_files:
+                    return
+                try:
+                    contents = repo.get_contents(path, ref=target_branch)
+                except Exception:
+                    return
 
-                    if name_lower in ("poetry.lock", "package-lock.json", "yarn.lock"):
-                        continue
-                    if ext in IGNORE_EXTENSIONS:
-                        continue
-                    if item.size > MAX_FILE_SIZE_BYTES:
-                        continue
+                if not isinstance(contents, list):
+                    contents = [contents]
 
-                    try:
-                        content_str = item.decoded_content.decode("utf-8", errors="ignore")
-                        files_dict[item.path] = content_str
-                    except Exception:
-                        pass
+                for item in contents:
+                    if len(files_dict) >= max_files:
+                        break
+                    if item.type == "dir":
+                        if item.name.lower() in IGNORE_DIRS:
+                            continue
+                        fetch_recursive(item.path)
+                    elif item.type == "file":
+                        name_lower = item.name.lower()
+                        _, ext = os.path.splitext(name_lower)
+                        if ext in IGNORE_EXTENSIONS or item.size > max_size_bytes:
+                            continue
+                        try:
+                            content_str = item.decoded_content.decode("utf-8", errors="ignore")
+                            files_dict[item.path] = content_str
+                        except Exception:
+                            pass
 
-        fetch_recursive()
-        return files_dict
+            fetch_recursive()
+            if files_dict:
+                return files_dict
+        except Exception as e:
+            print(f"[GitHub] PyGithub fallback error: {e}")
 
-    except Exception as e:
-        print(f"[GitHub] Ошибка get_repo_files: {e}")
-        return _get_repo_files_rest(repo_name)
+    # 3. Fallback на REST API
+    return _get_repo_files_rest(repo_name, branch=branch, max_files=max_files, max_size_bytes=max_size_bytes)
 
 
-def _get_repo_files_rest(repo_name: str) -> dict:
-    """Fallback скачивания файлов через REST API GitHub."""
+def _get_repo_files_rest(repo_name: str, branch: str = None, max_files: int = 50, max_size_bytes: int = MAX_FILE_SIZE_BYTES) -> dict:
+    """Fallback скачивания файлов через REST API GitHub с заголовками авторизации."""
     owner = GITHUB_USERNAME or "MATIN0893"
     target = repo_name.strip()
     full_name = target if "/" in target else f"{owner}/{target}"
 
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "Matin-Meta-Agent"
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-
+    headers = _get_auth_headers()
     files_dict = {}
 
+    target_branch = branch
+    if not target_branch:
+        meta = get_repo_metadata(full_name)
+        target_branch = meta.get("default_branch") if meta.get("success") else "main"
+
     def fetch_dir(path=""):
+        if len(files_dict) >= max_files:
+            return
         url = f"https://api.github.com/repos/{full_name}/contents/{path}".rstrip("/")
+        params = {"ref": target_branch}
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
             if resp.status_code != 200:
                 return
             items = resp.json()
             if not isinstance(items, list):
                 items = [items]
             for item in items:
+                if len(files_dict) >= max_files:
+                    break
                 itype = item.get("type")
                 ipath = item.get("path", "")
                 iname = item.get("name", "")
@@ -470,11 +681,13 @@ def _get_repo_files_rest(repo_name: str) -> dict:
                         continue
                     fetch_dir(ipath)
                 elif itype == "file":
-                    download_url = item.get("download_url")
-                    if download_url:
-                        fresp = requests.get(download_url, timeout=10)
-                        if fresp.status_code == 200:
-                            files_dict[ipath] = fresp.text
+                    name_lower = iname.lower()
+                    _, ext = os.path.splitext(name_lower)
+                    if ext in IGNORE_EXTENSIONS:
+                        continue
+                    file_res = get_repo_file_content(full_name, ipath, branch=target_branch)
+                    if file_res.get("success"):
+                        files_dict[ipath] = file_res["content"]
         except Exception:
             pass
 

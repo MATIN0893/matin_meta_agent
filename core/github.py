@@ -13,6 +13,10 @@ from services.github_service import (
     delete_repo,
     delete_repo_file,
     check_repo_exists,
+    get_repo_metadata,
+    get_repo_tree,
+    get_repo_files_list,
+    get_repo_file_content,
 )
 
 __all__ = [
@@ -30,4 +34,8 @@ __all__ = [
     "delete_repo",
     "delete_repo_file",
     "check_repo_exists",
+    "get_repo_metadata",
+    "get_repo_tree",
+    "get_repo_files_list",
+    "get_repo_file_content",
 ]

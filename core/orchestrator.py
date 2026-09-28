@@ -18,6 +18,7 @@ from core.prompts import (
     FIXER_SYSTEM,
     FIXER_USER,
 )
+import services.github_service as github_service
 from services.github_service import (
     list_user_repos,
     get_repo_files,
@@ -30,6 +31,10 @@ from services.github_service import (
     format_repositories_list,
     is_repo_list_intent,
     check_repo_exists,
+    get_repo_metadata,
+    get_repo_tree,
+    get_repo_files_list,
+    get_repo_file_content,
 )
 from config.settings import GITHUB_USERNAME
 from core.security import security_guard, Permission
@@ -236,7 +241,6 @@ def collect_project_files(parsed_data: dict, raw_text: str = "", default_target:
             logger.warning(f"Ошибка в regex p2: {e}")
 
         try:
-            # Исправленный regex p3: сбалансированные круглые скобки без syntax error
             p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)(?=(?:===\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)|\Z)""", re.DOTALL)
             for m in p3.finditer(raw_text):
                 extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
@@ -297,14 +301,14 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
     if is_repo_list_intent(prompt):
         await notify("📁 Запрашиваю список репозиториев с GitHub...")
-        repos_data = await asyncio.to_thread(get_user_repositories)
+        repos_data = await asyncio.to_thread(github_service.get_user_repositories)
         result = format_repositories_list(repos_data)
         task_engine.update_state(task.task_id, TaskState.COMPLETED, result=result)
         return result
 
     task_engine.update_state(task.task_id, TaskState.PLANNING)
     await notify("🧠 Анализирую задачу и составляю план...")
-    user_repos = await asyncio.to_thread(list_user_repos)
+    user_repos = await asyncio.to_thread(github_service.list_user_repos)
     repo_names_str = ", ".join(user_repos) if user_repos else "нет репозиториев"
 
     try:
@@ -342,14 +346,14 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
     if action in ("list", "list_repos", "repos", "list_projects"):
         await notify("📁 Запрашиваю список репозиториев с GitHub...")
-        repos_data = await asyncio.to_thread(get_user_repositories)
+        repos_data = await asyncio.to_thread(github_service.get_user_repositories)
         result = format_repositories_list(repos_data)
         task_engine.update_state(task.task_id, TaskState.COMPLETED, result=result)
         return result
 
     owner_name = (GITHUB_USERNAME or "MATIN0893").strip().lower()
     if project_name and project_name.strip().lower() in (owner_name, "matin0893"):
-        repos_data = await asyncio.to_thread(get_user_repositories)
+        repos_data = await asyncio.to_thread(github_service.get_user_repositories)
         exact_repo_exists = any(r.get("name", "").lower() == project_name.strip().lower() for r in repos_data)
         if not exact_repo_exists:
             if is_repo_list_intent(prompt) or any(w in prompt.lower() for w in ["репозитор", "проект", "repo", "список"]):
@@ -366,35 +370,159 @@ async def run_task(prompt: str, status_cb=None) -> str:
                 return msg
 
     if action == "delete":
-        matched_del = find_matching_repo_name(project_name)
+        matched_del = github_service.find_matching_repo_name(project_name)
         if matched_del and matched_del != project_name:
             project_name = matched_del
 
         if target_file:
             await notify(f"🗑 Удаляю файл {target_file} в репозитории {project_name}...")
-            ok = await asyncio.to_thread(delete_repo_file, project_name, target_file)
+            ok = await asyncio.to_thread(github_service.delete_repo_file, project_name, target_file)
             res = f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
         else:
             await notify(f"🗑 Удаляю репозиторий {project_name}...")
-            ok = await asyncio.to_thread(delete_repo, project_name)
+            ok = await asyncio.to_thread(github_service.delete_repo, project_name)
             res = f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
 
         task_engine.update_state(task.task_id, TaskState.COMPLETED if ok else TaskState.FAILED, result=res)
         return res
 
+    # -------------------------------------------------------------
+    # READ-ONLY PIPELINE: инспекция, просмотр структуры или файла
+    # БЕЗ модификации, БЕЗ сохранения и БЕЗ пуша в GitHub!
+    # -------------------------------------------------------------
+    prompt_lower = prompt.lower()
+    has_read_keywords = any(kw in prompt_lower for kw in [
+        "проверь", "прочитай", "покажи", "инспекция", "аудит", "анализ",
+        "что делает", "структура", "исследуй", "опиши", "read", "inspect",
+        "check", "view", "examine", "status"
+    ])
+    has_write_keywords = any(kw in prompt_lower for kw in [
+        "измени", "исправь", "перепиши", "добавь", "удали", "создай", "сгенерируй",
+        "закоммить", "пуш", "modify", "fix", "update", "create", "delete",
+        "write", "commit", "push", "patch"
+    ])
+
+    is_read_action = action in ("read", "inspect", "check", "view", "analyze", "info", "get", "status", "audit")
+    is_read_only = is_read_action or (has_read_keywords and not has_write_keywords)
+
+    if is_read_only:
+        task_engine.update_state(task.task_id, TaskState.EXECUTING)
+        matched_repo = github_service.find_matching_repo_name(project_name)
+        if matched_repo and matched_repo != project_name:
+            await notify(f"🔍 Репозиторий '{project_name}' определен как '{matched_repo}' (fuzzy match)...")
+            project_name = matched_repo
+
+        await notify(f"🔍 Инспектирую репозиторий {project_name} (READ-ONLY)...")
+
+        # 1. Получение метаданных
+        meta = await asyncio.to_thread(github_service.get_repo_metadata, project_name)
+        if not meta.get("success"):
+            err_code = meta.get("status_code", 0)
+            err_msg = meta.get("error", "Неизвестная ошибка")
+            endpoint = meta.get("endpoint", f"https://api.github.com/repos/{project_name}")
+            repos_data = await asyncio.to_thread(github_service.get_user_repositories)
+            repos_hint = format_repositories_list(repos_data)
+            diag = (
+                f"❌ **Ошибка доступа к репозиторию `{project_name}`**\n\n"
+                f"• **HTTP Status:** `{err_code}`\n"
+                f"• **Endpoint:** `{endpoint}`\n"
+                f"• **Причина:** {err_msg}\n\n"
+                f"{repos_hint}"
+            )
+            task_engine.update_state(task.task_id, TaskState.FAILED, error=diag)
+            return diag
+
+        default_branch = meta.get("default_branch", "main")
+        repo_url = meta.get("html_url", f"https://github.com/MATIN0893/{project_name}")
+        is_priv = meta.get("private", False)
+        vis_icon = "🔒 Приватный" if is_priv else "🌐 Публичный"
+
+        # 2. Если запрошен конкретный файл
+        if target_file:
+            await notify(f"📄 Читаю файл `{target_file}` из ветки `{default_branch}`...")
+            file_res = await asyncio.to_thread(github_service.get_repo_file_content, project_name, target_file, default_branch)
+            if file_res.get("success"):
+                fcontent = file_res.get("content", "")
+                ext = target_file.split(".")[-1] if "." in target_file else ""
+                lines_cnt = len(fcontent.splitlines())
+                preview = fcontent[:3500]
+                trunc_note = f"\n\n_... (показано первые 3500 символов из {len(fcontent)})_" if len(fcontent) > 3500 else ""
+                ans = (
+                    f"📄 **Файл `{target_file}` в [{project_name}]({repo_url})**\n\n"
+                    f"• **Ветка:** `{default_branch}` ({vis_icon})\n"
+                    f"• **Размер:** `{len(fcontent)} байт` ({lines_cnt} строк)\n\n"
+                    f"```{ext}\n{preview}\n```{trunc_note}"
+                )
+                task_engine.update_state(task.task_id, TaskState.COMPLETED, result=ans)
+                return ans
+            else:
+                err_ans = (
+                    f"❌ **Не удалось прочитать файл `{target_file}` в `{project_name}`**\n\n"
+                    f"• **HTTP Status:** `{file_res.get('status_code')}`\n"
+                    f"• **Endpoint:** `{file_res.get('endpoint')}`\n"
+                    f"• **Ветка:** `{default_branch}`\n"
+                    f"• **Причина:** {file_res.get('error')}"
+                )
+                task_engine.update_state(task.task_id, TaskState.FAILED, error=err_ans)
+                return err_ans
+
+        # 3. Инспекция всего репозитория (структура + стек + обзор)
+        await notify(f"📁 Получаю дерево файлов ветки `{default_branch}`...")
+        tree_info = await asyncio.to_thread(github_service.get_repo_tree, project_name, default_branch)
+        file_list = tree_info.get("files", []) if tree_info.get("success") else await asyncio.to_thread(github_service.get_repo_files_list, project_name, default_branch)
+
+        key_files = await asyncio.to_thread(github_service.get_repo_files, project_name, default_branch, 15)
+
+        files_preview = [f"• `{f}`" for f in file_list[:25]]
+        files_md = "\n".join(files_preview)
+        if len(file_list) > 25:
+            files_md += f"\n• _... и еще {len(file_list) - 25} файлов_"
+        elif not file_list:
+            files_md = "• _Файлы не обнаружены (репозиторий пуст)_"
+
+        stack_tags = []
+        all_texts = " ".join(key_files.values()).lower()
+        if "fastapi" in all_texts or "from fastapi" in all_texts or any("fastapi" in f for f in file_list):
+            stack_tags.append("FastAPI")
+        if "telegram" in all_texts or "telegram.ext" in all_texts or any("bot" in f for f in file_list):
+            stack_tags.append("Telegram Bot")
+        if "groq" in all_texts or "llama" in all_texts or any("groq" in f for f in file_list):
+            stack_tags.append("Groq LLM")
+        if "Dockerfile" in file_list or "docker" in all_texts:
+            stack_tags.append("Docker")
+        if "render.yaml" in file_list:
+            stack_tags.append("Render Cloud")
+        if not stack_tags:
+            stack_tags.append("Python 3")
+
+        desc = meta.get("description") or "Автономный микросервис"
+
+        report_msg = (
+            f"🔍 **ИНСПЕКЦИЯ РЕПОЗИТОРИЯ: [{project_name}]({repo_url})**\n\n"
+            f"• **Доступ:** {vis_icon}\n"
+            f"• **Основная ветка:** `{default_branch}`\n"
+            f"• **Стек технологий:** {', '.join(stack_tags)}\n"
+            f"• **Всего файлов в git tree:** `{len(file_list)}`\n"
+            f"• **Описание:** _{desc}_\n\n"
+            f"📂 **Структура файлов ({default_branch}):**\n{files_md}\n\n"
+            "✅ _READ-ONLY инспекция завершена успешно. Изменений в репозиторий не вносилось._"
+        )
+        task_engine.update_state(task.task_id, TaskState.COMPLETED, result=report_msg)
+        return report_msg
+
     files = {}
     task_engine.update_state(task.task_id, TaskState.EXECUTING)
 
     if action == "modify":
-        matched_repo = find_matching_repo_name(project_name)
+        matched_repo = github_service.find_matching_repo_name(project_name)
         if matched_repo and matched_repo != project_name:
             await notify(f"🔍 Репозиторий '{project_name}' найден как '{matched_repo}' (fuzzy match)...")
             project_name = matched_repo
 
         await notify(f"📥 Скачиваю файлы проекта {project_name}...")
-        existing_files = await asyncio.to_thread(get_repo_files, project_name)
+        existing_files = await asyncio.to_thread(github_service.get_repo_files, project_name)
         if not existing_files:
-            repos_data = await asyncio.to_thread(get_user_repositories)
+            repos_data = await asyncio.to_thread(github_service.get_user_repositories)
             repos_hint = format_repositories_list(repos_data)
             res = f"⚠️ Репозиторий `{project_name}` пуст или не найден на GitHub.\n\n{repos_hint}"
             task_engine.update_state(task.task_id, TaskState.FAILED, error=res)
@@ -530,7 +658,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
     task_engine.update_state(task.task_id, TaskState.DEPLOYING)
     await notify(f"🚀 Загружаю код в GitHub репозиторий {project_name}...")
-    repo_url = await asyncio.to_thread(push_project, project_name, files)
+    repo_url = await asyncio.to_thread(github_service.push_project, project_name, files)
 
     memory.record_project(
         name=project_name,
