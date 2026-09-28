@@ -228,7 +228,7 @@ def collect_project_files(parsed_data: dict, raw_text: str = "", default_target:
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
         # Паттерн 3: === path/to/file.py ===
-        p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===)|\Z)""", re.DOTALL)
+        p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+\s*===)|\Z)""", re.DOTALL)
         for m in p3.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
