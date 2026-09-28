@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import json
 import re
+import time
 from core.llm_client import ask
 from core.prompts import (
     PLANNER_SYSTEM,
@@ -29,6 +30,10 @@ from services.github_service import (
     is_repo_list_intent,
 )
 from config.settings import GITHUB_USERNAME
+from core.security import security_guard, Permission
+from core.memory import memory
+from core.task_engine import task_engine, TaskState
+from engine.agent_registry import agent_registry, AgentLifecycle
 
 try:
     from services.patrol_service import record_brain_success
@@ -125,7 +130,6 @@ def extract_regex_fields(text: str) -> dict:
 
 
 def safe_parse_json(text: str) -> dict:
-    """Извлекает и парсит JSON даже при наличии markdown-разметки или неэкранированных строк."""
     if not text or not isinstance(text, str):
         return {}
     cleaned = text.strip()
@@ -187,7 +191,6 @@ def safe_parse_json(text: str) -> dict:
 
 
 def collect_project_files(parsed_data: dict, raw_text: str = "", default_target: str = "", existing_files: dict = None) -> dict:
-    """Устойчивый сборщик файлов проекта из различных вариантов ответа LLM."""
     extracted = {}
 
     if isinstance(parsed_data, dict):
@@ -222,7 +225,7 @@ def collect_project_files(parsed_data: dict, raw_text: str = "", default_target:
         for m in p2.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
-        p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+\s*===)|\Z)""", re.DOTALL)
+        p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===)|\Z)""", re.DOTALL)
         for m in p3.finditer(raw_text):
             extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
 
@@ -263,7 +266,8 @@ def get_field(data, key: str, default=None):
 
 
 async def run_task(prompt: str, status_cb=None) -> str:
-    """Асинхронная точка входа для оркестратора задач."""
+    task = task_engine.create_task(user_id=0, command=prompt)
+
     async def notify(msg: str):
         if status_cb:
             try:
@@ -274,12 +278,14 @@ async def run_task(prompt: str, status_cb=None) -> str:
             except Exception:
                 pass
 
-    # 1. Быстрый перехват намерения запросить список репозиториев
     if is_repo_list_intent(prompt):
         await notify("📁 Запрашиваю список репозиториев с GitHub...")
         repos_data = await asyncio.to_thread(get_user_repositories)
-        return format_repositories_list(repos_data)
+        result = format_repositories_list(repos_data)
+        task_engine.update_state(task.task_id, TaskState.COMPLETED, result=result)
+        return result
 
+    task_engine.update_state(task.task_id, TaskState.PLANNING)
     await notify("🧠 Анализирую задачу и составляю план...")
     user_repos = await asyncio.to_thread(list_user_repos)
     repo_names_str = ", ".join(user_repos) if user_repos else "нет репозиториев"
@@ -297,10 +303,14 @@ async def run_task(prompt: str, status_cb=None) -> str:
     try:
         plan = safe_parse_json(plan_raw)
     except Exception as e:
-        return f"❌ Ошибка разбора плана: {e}"
+        err_msg = f"❌ Ошибка разбора плана: {e}"
+        task_engine.update_state(task.task_id, TaskState.FAILED, error=err_msg)
+        return err_msg
 
     if not plan:
-        return "❌ Ошибка разбора плана: модель вернула некорректный ответ."
+        err_msg = "❌ Ошибка разбора плана: модель вернула некорректный ответ."
+        task_engine.update_state(task.task_id, TaskState.FAILED, error=err_msg)
+        return err_msg
 
     record_brain_success()
 
@@ -310,28 +320,34 @@ async def run_task(prompt: str, status_cb=None) -> str:
     task_desc = get_field(plan, "task_description", default=prompt)
     extracted_env = get_field(plan, "env", default={})
 
-    # Сценарий: Запрос списка репозиториев из ответа LLM
+    task.plan = plan
+    task.log_action("planned", details=f"action={action} project={project_name}")
+
     if action in ("list", "list_repos", "repos", "list_projects"):
         await notify("📁 Запрашиваю список репозиториев с GitHub...")
         repos_data = await asyncio.to_thread(get_user_repositories)
-        return format_repositories_list(repos_data)
+        result = format_repositories_list(repos_data)
+        task_engine.update_state(task.task_id, TaskState.COMPLETED, result=result)
+        return result
 
-    # Проверка: если LLM посчитал имя аккаунта именем репозитория
     owner_name = (GITHUB_USERNAME or "MATIN0893").strip().lower()
     if project_name and project_name.strip().lower() in (owner_name, "matin0893"):
         repos_data = await asyncio.to_thread(get_user_repositories)
         exact_repo_exists = any(r.get("name", "").lower() == project_name.strip().lower() for r in repos_data)
         if not exact_repo_exists:
             if is_repo_list_intent(prompt) or any(w in prompt.lower() for w in ["репозитор", "проект", "repo", "список"]):
-                return format_repositories_list(repos_data)
+                result = format_repositories_list(repos_data)
+                task_engine.update_state(task.task_id, TaskState.COMPLETED, result=result)
+                return result
             else:
-                return (
+                msg = (
                     f"⚠️ `{project_name}` — это имя профиля GitHub, а не конкретный репозиторий.\n\n"
                     f"{format_repositories_list(repos_data)}\n\n"
                     f"Пожалуйста, уточни имя проекта."
                 )
+                task_engine.update_state(task.task_id, TaskState.FAILED, error=msg)
+                return msg
 
-    # Сценарий: Удаление
     if action == "delete":
         matched_del = find_matching_repo_name(project_name)
         if matched_del and matched_del != project_name:
@@ -340,17 +356,19 @@ async def run_task(prompt: str, status_cb=None) -> str:
         if target_file:
             await notify(f"🗑 Удаляю файл {target_file} в репозитории {project_name}...")
             ok = await asyncio.to_thread(delete_repo_file, project_name, target_file)
-            return f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
+            res = f"✅ Файл {target_file} удален." if ok else f"❌ Не удалось удалить файл {target_file}."
         else:
             await notify(f"🗑 Удаляю репозиторий {project_name}...")
             ok = await asyncio.to_thread(delete_repo, project_name)
-            return f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
+            res = f"✅ Репозиторий {project_name} успешно удален." if ok else f"❌ Не удалось удалить репозиторий {project_name}."
+
+        task_engine.update_state(task.task_id, TaskState.COMPLETED if ok else TaskState.FAILED, result=res)
+        return res
 
     files = {}
+    task_engine.update_state(task.task_id, TaskState.EXECUTING)
 
-    # Сценарий: Модификация (MODIFIER)
     if action == "modify":
-        # Нечеткий поиск репозитория перед скачиванием
         matched_repo = find_matching_repo_name(project_name)
         if matched_repo and matched_repo != project_name:
             await notify(f"🔍 Репозиторий '{project_name}' найден как '{matched_repo}' (fuzzy match)...")
@@ -361,11 +379,12 @@ async def run_task(prompt: str, status_cb=None) -> str:
         if not existing_files:
             repos_data = await asyncio.to_thread(get_user_repositories)
             repos_hint = format_repositories_list(repos_data)
-            return f"⚠️ Репозиторий `{project_name}` пуст или не найден на GitHub.\n\n{repos_hint}"
+            res = f"⚠️ Репозиторий `{project_name}` пуст или не найден на GitHub.\n\n{repos_hint}"
+            task_engine.update_state(task.task_id, TaskState.FAILED, error=res)
+            return res
 
         await notify(f"⚙️ Senior Maintainer: пересобираю кодовую базу {project_name}...")
 
-        # Фильтруем мусор и укладываемся в лимит Groq
         SKIP_EXT = {'.md', '.txt', '.log', '.lock', '.png', '.jpg', '.svg', '.ico'}
         SKIP_DIRS = {'node_modules', '.git', '__pycache__', 'dist', 'build', '.venv'}
 
@@ -413,7 +432,6 @@ async def run_task(prompt: str, status_cb=None) -> str:
         )
         record_brain_success()
 
-    # Сценарий: Создание нового проекта (ENGINEER)
     else:
         await notify(f"⚙️ Lead Engineer: генерирую проект {project_name}...")
         eng_raw = await asyncio.to_thread(
@@ -439,9 +457,17 @@ async def run_task(prompt: str, status_cb=None) -> str:
         record_brain_success()
 
     if not files:
-        return "⚠️ Не удалось получить файлы для сохранения."
+        res = "⚠️ Не удалось получить файлы для сохранения."
+        task_engine.update_state(task.task_id, TaskState.FAILED, error=res)
+        return res
 
-    # Рецензент (REVIEWER)
+    for fname, fcontent in files.items():
+        has_secret, labels = security_guard.contains_secrets(fcontent)
+        if has_secret:
+            await notify(f"⚠️ Security Guard: замаскирован токен в файле `{fname}`")
+            files[fname] = security_guard.sanitize_secrets(fcontent)
+
+    task_engine.update_state(task.task_id, TaskState.TESTING)
     await notify("🔍 Code Reviewer: проверяю качество кода...")
     review_dump = "\n\n".join([f"=== {path} ===\n{content}" for path, content in files.items()])
     try:
@@ -456,8 +482,8 @@ async def run_task(prompt: str, status_cb=None) -> str:
         status = "APPROVED"
         review_data = {}
 
-    # Доработка замечаний (FIXER)
     if status != "APPROVED":
+        task_engine.update_state(task.task_id, TaskState.VALIDATING)
         await notify("🔧 Bug Fixer: устраняю замечания...")
         try:
             fix_raw = await asyncio.to_thread(
@@ -485,9 +511,20 @@ async def run_task(prompt: str, status_cb=None) -> str:
         except Exception:
             pass
 
-    # Пуш в GitHub
+    task_engine.update_state(task.task_id, TaskState.DEPLOYING)
     await notify(f"🚀 Загружаю код в GitHub репозиторий {project_name}...")
     repo_url = await asyncio.to_thread(push_project, project_name, files)
-    return f"✅ Проект {project_name} успешно обновлен и опубликован на GitHub!\n🔗 {repo_url}"
+
+    memory.record_project(
+        name=project_name,
+        repo=repo_url,
+        description=task_desc,
+        status="active"
+    )
+
+    final_msg = f"✅ Проект {project_name} успешно обновлен и опубликован на GitHub!\n🔗 {repo_url}"
+    task_engine.update_state(task.task_id, TaskState.COMPLETED, result=final_msg)
+    return final_msg
+
 
 orchestrate = run_task

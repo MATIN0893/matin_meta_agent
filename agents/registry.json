@@ -1,0 +1,23 @@
+{
+  "matin-monitor": {
+    "agent_id": "matin-monitor",
+    "name": "Matin Monitor",
+    "status": "ready",
+    "version": "1.0.0",
+    "description": "Автономный монитор состояния Telegram-ботов и сервисов",
+    "permissions": [
+      "health.check",
+      "filesystem.read"
+    ],
+    "github_repo": "agents/matin-monitor",
+    "render_service_id": "",
+    "health_url": "",
+    "created_at": 1790630886.9085107,
+    "updated_at": 1790630886.9143262,
+    "last_health_check": {},
+    "config": {
+      "created_via": "Agent Factory 2.0",
+      "path": "agents/matin-monitor"
+    }
+  }
+}
