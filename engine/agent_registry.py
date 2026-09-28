@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 import logging
 from enum import Enum
@@ -147,14 +148,45 @@ class AgentRegistry:
         self.save()
         return agent
 
+    def find_agent(self, query: str) -> Optional[AgentRecord]:
+        """Универсальный поиск агента по id, имени, slug или подстроке."""
+        if not query:
+            return None
+        q = query.strip()
+        # 1. Точное совпадение по agent_id
+        if q in self.agents:
+            return self.agents[q]
+        # 2. Без учета регистра по agent_id
+        q_lower = q.lower()
+        for aid, a in self.agents.items():
+            if aid.lower() == q_lower:
+                return a
+        # 3. Совпадение по названию (name)
+        for aid, a in self.agents.items():
+            if a.name.lower() == q_lower:
+                return a
+        # 4. Нормализованный slug
+        q_slug = q_lower.replace(" ", "-").replace("_", "-")
+        for aid, a in self.agents.items():
+            if aid.lower() == q_slug or aid.lower().replace("_", "-") == q_slug:
+                return a
+            if not q_slug.startswith("matin-"):
+                if aid.lower() == f"matin-{q_slug}":
+                    return a
+        # 5. Подстрока
+        for aid, a in self.agents.items():
+            if q_lower in aid.lower() or q_lower in a.name.lower():
+                return a
+        return None
+
     def get_agent(self, agent_id: str) -> Optional[AgentRecord]:
-        return self.agents.get(agent_id)
+        return self.find_agent(agent_id)
 
     def list_agents(self) -> List[AgentRecord]:
         return list(self.agents.values())
 
     def update_status(self, agent_id: str, status: AgentLifecycle, health_data: dict = None) -> bool:
-        agent = self.agents.get(agent_id)
+        agent = self.find_agent(agent_id)
         if not agent:
             return False
         agent.status = status
@@ -164,12 +196,28 @@ class AgentRegistry:
         self.save()
         return True
 
-    def delete_agent(self, agent_id: str) -> bool:
-        if agent_id in self.agents:
-            del self.agents[agent_id]
+    def delete_agent(self, target: str) -> bool:
+        agent = self.find_agent(target)
+        if not agent:
+            if target in self.agents:
+                agent = self.agents[target]
+            else:
+                return False
+
+        aid = agent.agent_id
+        if aid in self.agents:
+            del self.agents[aid]
             self.save()
-            return True
-        return False
+
+        # Очищаем локальные файлы агента, если директория существует
+        agent_dir = os.path.join("agents", aid)
+        if os.path.exists(agent_dir):
+            try:
+                shutil.rmtree(agent_dir)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить файлы {agent_dir}: {e}")
+
+        return True
 
 
 agent_registry = AgentRegistry()

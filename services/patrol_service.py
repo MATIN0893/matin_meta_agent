@@ -5,11 +5,16 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 import httpx
-from telegram import Bot
 from services.render_service import get_services, get_service_logs, restart_service
 from services.health_service import update_patrol_heartbeat
 from engine.agent_registry import agent_registry, AgentLifecycle
 from core.llm_client import check_llm_health
+
+try:
+    from telegram import Bot
+except ImportError:
+    class Bot:
+        pass
 
 logger = logging.getLogger("MATIN.PATROL")
 
@@ -81,27 +86,65 @@ def classify_logs(logs: str) -> str:
     return "UNKNOWN"
 
 
-async def check_single_service(client: httpx.AsyncClient, bot: Bot, srv_name: str, srv_url: str, render_id: str):
+async def check_single_service(
+    client: httpx.AsyncClient,
+    bot: Bot,
+    srv_name: str,
+    srv_url: str,
+    render_id: str,
+    health_check_path: str = ""
+):
+    """
+    Проверяет сервис с учетом реального сконфигурированного endpoint на Render.
+    Не маскирует HTTP 404 как OK.
+    """
     if srv_name not in STATE:
         STATE[srv_name] = RuntimeState()
 
     st = STATE[srv_name]
     details = ""
+    is_up = False
+    last_status = None
 
     if srv_url:
-        try:
-            r = await client.get(f"{srv_url}/health", timeout=HEALTH_TIMEOUT)
-            if r.status_code == 200:
-                if st.state != ServiceState.HEALTHY:
-                    st.state = ServiceState.HEALTHY
-                    st.failures = 0
-                    await notify(bot, f"🟢 *СЕРВИС ВОССТАНОВЛЕН*\n`{srv_name}` снова в строю!")
-                return
-            details = f"HTTP {r.status_code}"
-        except Exception as e:
-            details = f"Сеть / таймаут: {e}"
+        base = srv_url.rstrip("/")
+        # Определяем список endpoint для проверки
+        configured_path = health_check_path.strip() if health_check_path else ""
+        endpoints = []
+        if configured_path:
+            endpoints.append(configured_path if configured_path.startswith("/") else f"/{configured_path}")
+        if "/health" not in endpoints:
+            endpoints.append("/health")
+        for fallback in ["/", "/ping"]:
+            if fallback not in endpoints:
+                endpoints.append(fallback)
+
+        for ep in endpoints:
+            url = f"{base}{ep}"
+            try:
+                r = await client.get(url, timeout=HEALTH_TIMEOUT)
+                last_status = r.status_code
+                if r.status_code in (200, 204):
+                    is_up = True
+                    break
+            except Exception as e:
+                details = f"Сеть / таймаут: {e}"
+
+        if not is_up:
+            # Не маскируем 404 как OK!
+            if last_status == 404:
+                details = f"HTTP 404 (endpoint '{endpoints[0]}' не найден)"
+            elif last_status is not None:
+                details = f"HTTP {last_status}"
     else:
-        details = "Проверка по логам"
+        details = "Проверка по логам (URL не задан)"
+
+    if is_up:
+        if st.state != ServiceState.HEALTHY:
+            st.state = ServiceState.HEALTHY
+            st.failures = 0
+            await notify(bot, f"🟢 *СЕРВИС ВОССТАНОВЛЕН*\n`{srv_name}` снова в строю!")
+        return
 
     st.failures += 1
     st.last_error = details
@@ -122,6 +165,38 @@ async def check_single_service(client: httpx.AsyncClient, bot: Bot, srv_name: st
                 restart_service(render_id)
         elif err_type == "CODE_ERROR":
             await notify(bot, f"🛠 *ОШИБКА В КОДЕ*\nПроект: `{srv_name}`\nНайдена ошибка выполнения. Передаю задачу в Self-Heal...")
+            # Реальный запуск Self-Heal с восстановлением!
+            try:
+                from engine.self_heal import attempt_self_heal
+                heal_result = await asyncio.to_thread(
+                    attempt_self_heal,
+                    srv_name=srv_name,
+                    render_id=render_id,
+                    error_logs=logs,
+                    bot=bot
+                )
+                if heal_result.get("success"):
+                    st.state = ServiceState.HEALTHY
+                    st.failures = 0
+                    await notify(bot, (
+                        f"✅ *SELF-HEAL: ПАТЧ УСПЕШНО ПРИМЕНЕН!*\n\n"
+                        f"• Проект: `{srv_name}`\n"
+                        f"• Исправлен файл: `{heal_result.get('target_file')}`\n"
+                        f"• Репозиторий: {heal_result.get('repo_url')}\n"
+                        f"• Контейнер: {'Перезапущен на Render' if heal_result.get('restarted') else 'Деплой запущен'}\n\n"
+                        f"Сервис восстанавливается."
+                    ))
+                else:
+                    reason = heal_result.get("reason", "Неизвестная ошибка")
+                    await notify(bot, (
+                        f"⚠️ *SELF-HEAL: Автовосстановление не удалось*\n\n"
+                        f"• Проект: `{srv_name}`\n"
+                        f"• Причина: `{reason}`\n"
+                        f"Требуется ручная инспекция кода."
+                    ))
+            except Exception as exc:
+                logger.error(f"[PATROL] Ошибка в процессе Self-Heal: {exc}")
+                await notify(bot, f"❌ Сбой запуска Self-Heal для `{srv_name}`: {exc}")
 
 
 async def check_registered_agents(client: httpx.AsyncClient, bot: Bot):
@@ -161,9 +236,17 @@ async def patrol_loop(bot: Bot):
                     name = srv.get("name")
                     srv_id = srv.get("id")
                     url = srv.get("serviceDetails", {}).get("url") or ""
+                    health_path = srv.get("serviceDetails", {}).get("healthCheckPath") or ""
 
                     if name and srv_id:
-                        await check_single_service(client, bot, name, url, srv_id)
+                        await check_single_service(
+                            client=client,
+                            bot=bot,
+                            srv_name=name,
+                            srv_url=url,
+                            render_id=srv_id,
+                            health_check_path=health_path
+                        )
                         await asyncio.sleep(2)
 
                 await check_registered_agents(client, bot)

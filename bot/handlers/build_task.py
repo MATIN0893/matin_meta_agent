@@ -1,7 +1,5 @@
 import asyncio
 import re
-from telegram import Update
-from telegram.ext import ContextTypes
 from config.settings import is_user_allowed
 from core.orchestrator import run_task
 from core.security import security_guard
@@ -12,6 +10,15 @@ from services.github_service import (
     get_user_repositories,
     format_repositories_list,
 )
+
+try:
+    from telegram import Update
+    from telegram.ext import ContextTypes
+except ImportError:
+    class Update:
+        pass
+    class ContextTypes:
+        DEFAULT_TYPE = None
 
 
 def is_agent_list_intent(text: str) -> bool:
@@ -33,6 +40,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
+    # 1. Проверка подтверждения деструктивных действий (Security Guard)
     is_confirmed, pending = security_guard.check_confirmation(user_id, text)
     if is_confirmed and pending:
         act = pending.get("action")
@@ -41,11 +49,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if act == "delete_agent":
             ok = agent_registry.delete_agent(target)
             if ok:
-                await msg.edit_text(f"✅ Агент `{target}` успешно удален из реестра.")
+                await msg.edit_text(f"✅ Агент `{target}` успешно удален из реестра и с диска.")
             else:
                 await msg.edit_text(f"❌ Агент `{target}` не найден в реестре.")
         return
 
+    # 2. Интент списка агентов
     if is_agent_list_intent(text):
         agents = agent_registry.list_agents()
         if not agents:
@@ -58,6 +67,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
+    # 3. Интент создания нового агента (Agent Factory)
     if is_create_agent_intent(text):
         msg = await update.message.reply_text("🏭 **Agent Factory запущена**\nАнализирую требования к агенту...")
 
@@ -86,6 +96,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Фатальный сбой Agent Factory: {e}")
         return
 
+    # 4. Интент удаления агента (Security Guard с подтверждением)
+    del_match = re.search(r"^(?:удали|удалить)\s+агента(?:\s*:)?\s*[`'\"«]?([^`'\"»\n]+?)[`'\"»]?$", text, re.I)
+    if del_match:
+        target_agent = del_match.group(1).strip()
+        existing = agent_registry.find_agent(target_agent)
+        aid_to_del = existing.agent_id if existing else target_agent
+        display_name = existing.name if existing else target_agent
+
+        warn_msg = security_guard.create_confirmation_request(
+            user_id=user_id,
+            action="delete_agent",
+            target=aid_to_del,
+            payload={"agent_id": aid_to_del, "name": display_name}
+        )
+        await update.message.reply_text(warn_msg, parse_mode="Markdown")
+        return
+
+    # 5. Интент списка репозиториев
     if is_repo_list_intent(text):
         msg = await update.message.reply_text("🔍 Запрашиваю список репозиториев с GitHub...")
         try:
@@ -96,13 +124,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Ошибка при получении репозиториев: {e}")
         return
 
-    del_match = re.search(r"^(удали|удалить)\s+агента\s+([a-zA-Z0-9_\-]+)", text, re.I)
-    if del_match:
-        target_agent = del_match.group(2).strip()
-        warn_msg = security_guard.create_confirmation_request(user_id, "delete_agent", target_agent)
-        await update.message.reply_text(warn_msg, parse_mode="Markdown")
-        return
-
+    # 6. Общая инженерная задача
     msg = await update.message.reply_text("⚙️ Принял задачу, начинаю...")
 
     async def progress(step: str):

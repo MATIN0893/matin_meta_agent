@@ -12,6 +12,7 @@ from services.github_service import (
     push_project,
     delete_repo,
     delete_repo_file,
+    check_repo_exists,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "push_project",
     "delete_repo",
     "delete_repo_file",
+    "check_repo_exists",
 ]

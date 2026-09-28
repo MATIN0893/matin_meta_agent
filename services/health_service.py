@@ -2,6 +2,7 @@ import json
 import time
 import os
 import logging
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from config.settings import GITHUB_TOKEN, GITHUB_USERNAME, RENDER_API_KEY
 from core.task_engine import task_engine
@@ -19,6 +20,8 @@ PATROL_STATS = {
     "last_error": ""
 }
 
+_github_status_cache = {"status": "unknown", "checked_at": 0.0}
+
 
 def update_patrol_heartbeat(success: bool = True, error_msg: str = ""):
     PATROL_STATS["is_alive"] = True
@@ -30,6 +33,62 @@ def update_patrol_heartbeat(success: bool = True, error_msg: str = ""):
     else:
         PATROL_STATS["consecutive_errors"] += 1
         PATROL_STATS["last_error"] = error_msg
+
+
+def check_github_status() -> dict:
+    """
+    Проверяет реальный статус GitHub API.
+    Не маскирует 404 или ошибки как OK.
+    """
+    global _github_status_cache
+    now = time.time()
+    if now - _github_status_cache["checked_at"] < 60:
+        return _github_status_cache
+
+    if not GITHUB_TOKEN:
+        res = {"status": "no_token", "username": GITHUB_USERNAME or "not_configured", "checked_at": now}
+        _github_status_cache = res
+        return res
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "User-Agent": "Matin-Meta-Agent"
+    }
+
+    try:
+        resp = requests.get("https://api.github.com/user", headers=headers, timeout=5)
+        if resp.status_code == 200:
+            user_data = resp.json()
+            res = {
+                "status": "ok",
+                "username": user_data.get("login") or GITHUB_USERNAME,
+                "checked_at": now
+            }
+        elif resp.status_code == 404:
+            res = {
+                "status": "http_404",
+                "error": "GitHub API /user returned 404 Not Found",
+                "username": GITHUB_USERNAME or "not_configured",
+                "checked_at": now
+            }
+        else:
+            res = {
+                "status": f"http_{resp.status_code}",
+                "error": f"GitHub API error {resp.status_code}",
+                "username": GITHUB_USERNAME or "not_configured",
+                "checked_at": now
+            }
+    except Exception as e:
+        res = {
+            "status": "network_error",
+            "error": str(e),
+            "username": GITHUB_USERNAME or "not_configured",
+            "checked_at": now
+        }
+
+    _github_status_cache = res
+    return res
 
 
 def get_full_health_report() -> dict:
@@ -45,8 +104,10 @@ def get_full_health_report() -> dict:
     active_tasks = task_engine.list_active_tasks()
     agents = agent_registry.list_agents()
 
+    gh_info = check_github_status()
+
     overall_status = "ok"
-    if patrol_status == "degraded":
+    if patrol_status == "degraded" or gh_info.get("status") in ("http_404", "network_error"):
         overall_status = "degraded"
 
     return {
@@ -67,10 +128,7 @@ def get_full_health_report() -> dict:
                 "last_run_seconds_ago": round(now - PATROL_STATS["last_run"], 1) if PATROL_STATS["last_run"] > 0 else None,
                 "consecutive_errors": PATROL_STATS["consecutive_errors"]
             },
-            "github": {
-                "status": "ok" if GITHUB_TOKEN else "no_token",
-                "username": GITHUB_USERNAME or "not_configured"
-            },
+            "github": gh_info,
             "render": {
                 "status": "ok" if RENDER_API_KEY else "no_key"
             }

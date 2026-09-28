@@ -2,6 +2,7 @@ import ast
 import asyncio
 import inspect
 import json
+import logging
 import re
 import time
 from core.llm_client import ask
@@ -28,12 +29,15 @@ from services.github_service import (
     find_matching_repo_name,
     format_repositories_list,
     is_repo_list_intent,
+    check_repo_exists,
 )
 from config.settings import GITHUB_USERNAME
 from core.security import security_guard, Permission
 from core.memory import memory
 from core.task_engine import task_engine, TaskState
 from engine.agent_registry import agent_registry, AgentLifecycle
+
+logger = logging.getLogger("MATIN.ORCHESTRATOR")
 
 try:
     from services.patrol_service import record_brain_success
@@ -98,22 +102,22 @@ def extract_regex_fields(text: str) -> dict:
     result = {}
 
     for field in ["action", "project_name", "target_file", "file_path", "status"]:
-        m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', text, re.IGNORECASE)
+        m = re.search(rf'\"{field}\"\s*:\s*\"([^\"]*)\"', text, re.IGNORECASE)
         if m:
             result[field] = m.group(1).strip()
 
     for field in ["code", "task_description", "plan", "explanation"]:
-        m = re.search(rf'"{field}"\s*:\s*"(.*?)"(?=\s*,\s*"[a-zA-Z_]+"|\s*}})', text, re.DOTALL)
+        m = re.search(rf'\"{field}\"\s*:\s*\"(.*?)\"(?=\s*,\s*\"[a-zA-Z_]+\"|\s*}})', text, re.DOTALL)
         if m:
             val = m.group(1)
             val = val.replace('\\"', '"').replace('\\\\', '\\')
             result[field] = val
 
     files = {}
-    files_block_match = re.search(r'"files"\s*:\s*\{(.*?)\}(?=\s*,\s*"[a-zA-Z_]+"|\s*$|\s*\})', text, re.DOTALL)
+    files_block_match = re.search(r'\"files\"\s*:\s*\{(.*?)\}(?=\s*,\s*\"[a-zA-Z_]+\"|\s*$|\s*\})', text, re.DOTALL)
     block = files_block_match.group(1) if files_block_match else text
 
-    file_matches = re.finditer(r'"([a-zA-Z0-9_./\-]+)"\s*:\s*"(.*?)"(?=\s*,\s*"[a-zA-Z0-9_./\-]+"|\s*$|\s*\})', block, re.DOTALL)
+    file_matches = re.finditer(r'\"([a-zA-Z0-9_./\-]+)\"\s*:\s*\"(.*?)\"(?=\s*,\s*\"[a-zA-Z0-9_./\-]+\"|\s*$|\s*\})', block, re.DOTALL)
     for fm in file_matches:
         f_name = fm.group(1).strip()
         if is_plausible_file_path(f_name):
@@ -217,21 +221,34 @@ def collect_project_files(parsed_data: dict, raw_text: str = "", default_target:
                 extracted[str(fpath).strip()] = clean_code_snippet(code)
 
     if not extracted and raw_text:
-        p1 = re.compile(r"""```(?:python|py|json|sh|bash)?(?::|\s+title=['"]?|\s+file=['"]?|\s+filename=['"]?|\s+path=['"]?|\s+)([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)['"]?\s*\n(.*?)```""", re.DOTALL)
-        for m in p1.finditer(raw_text):
-            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        try:
+            p1 = re.compile(r"""```(?:python|py|json|sh|bash)?(?::|\s+title=['"]?|\s+file=['"]?|\s+filename=['"]?|\s+path=['"]?|\s+)([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)['"]?\s*\n(.*?)```""", re.DOTALL)
+            for m in p1.finditer(raw_text):
+                extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        except Exception as e:
+            logger.warning(f"Ошибка в regex p1: {e}")
 
-        p2 = re.compile(r"""```(?:[a-zA-Z0-9_\-]+)?\s*\n\s*(?:#|//|--)\s*(?:file(?:path|name)?|path):\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*\n(.*?)```""", re.DOTALL)
-        for m in p2.finditer(raw_text):
-            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        try:
+            p2 = re.compile(r"""```(?:[a-zA-Z0-9_\-]+)?\s*\n\s*(?:#|//|--)\s*(?:file(?:path|name)?|path):\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*\n(.*?)```""", re.DOTALL)
+            for m in p2.finditer(raw_text):
+                extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        except Exception as e:
+            logger.warning(f"Ошибка в regex p2: {e}")
 
-        p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)((?====\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===)|\Z)""", re.DOTALL)
-        for m in p3.finditer(raw_text):
-            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        try:
+            # Исправленный regex p3: сбалансированные круглые скобки без syntax error
+            p3 = re.compile(r"""===\s*([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)\s*===\s*\n(.*?)(?=(?:===\s*[a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)|\Z)""", re.DOTALL)
+            for m in p3.finditer(raw_text):
+                extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        except Exception as e:
+            logger.warning(f"Ошибка в regex p3: {e}")
 
-        p4 = re.compile(r"""#{1,4}\s*[`'"]?([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)[`'"]?\s*\n\s*```(?:[a-zA-Z0-9_\-]+)?\s*\n(.*?)```""", re.DOTALL)
-        for m in p4.finditer(raw_text):
-            extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        try:
+            p4 = re.compile(r"""#{1,4}\s*[`'"]?([a-zA-Z0-9_./\-]+\.[a-zA-Z0-9_]+)[`'"]?\s*\n\s*```(?:[a-zA-Z0-9_\-]+)?\s*\n(.*?)```""", re.DOTALL)
+            for m in p4.finditer(raw_text):
+                extracted[m.group(1).strip()] = clean_code_snippet(m.group(2))
+        except Exception as e:
+            logger.warning(f"Ошибка в regex p4: {e}")
 
     if not extracted:
         candidate_code = ""

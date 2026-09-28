@@ -11,19 +11,23 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Актуальные модели Groq (GPT-OSS)
+# Актуальные рабочие модели Groq
 DEFAULT_GROQ_MODELS = [
-    "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
+    "moonshotai/kimi-k2-instruct",
 ]
 
-# Актуальные модели OpenRouter
+# Актуальные рабочие модели OpenRouter
 DEFAULT_OPENROUTER_MODELS = [
     "openrouter/free",
     "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
     "meta-llama/llama-3.3-70b-instruct",
     "meta-llama/llama-3.1-8b-instruct",
     "qwen/qwen-2.5-coder-32b-instruct",
+    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
 ]
 
@@ -35,6 +39,8 @@ DEPRECATED_MODELS = {
     "meta-llama/llama-3.1-8b-instruct:free",
     "qwen/qwen-2.5-coder-32b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
+    "google/gemini-flash-1.5-exp",
+    "anthropic/claude-3-haiku:free",
 }
 
 _cached_groq_models = []
@@ -103,7 +109,7 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
         groq_models = []
         if configured_groq_model and configured_groq_model not in DEPRECATED_MODELS:
             groq_models.append(configured_groq_model)
-        for m in ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]:
+        for m in DEFAULT_GROQ_MODELS:
             if m not in groq_models and m not in DEPRECATED_MODELS:
                 groq_models.append(m)
         for m in live_groq:
@@ -118,7 +124,8 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
-                if max_tokens < 500:
+                # Безопасно передаем reasoning_effort только для поддерживаемых моделей
+                if any(r in model.lower() for r in ["gpt-oss", "o1", "o3", "reasoner"]) and max_tokens < 500:
                     payload["reasoning_effort"] = "low"
 
                 resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
@@ -126,8 +133,31 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     data = resp.json()
                     choice = data.get("choices", [{}])[0]
                     msg = choice.get("message", {})
-                    content = msg.get("content") or msg.get("reasoning") or choice.get("text") or "OK"
-                    return content
+                    content = (
+                        msg.get("content")
+                        or msg.get("reasoning")
+                        or msg.get("reasoning_content")
+                        or choice.get("text")
+                    )
+                    if content and str(content).strip():
+                        return str(content).strip()
+                elif resp.status_code == 400 and "reasoning_effort" in payload:
+                    # Повторная попытка без reasoning_effort в случае 400
+                    del payload["reasoning_effort"]
+                    retry_resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+                    if retry_resp.status_code == 200:
+                        data = retry_resp.json()
+                        choice = data.get("choices", [{}])[0]
+                        msg = choice.get("message", {})
+                        content = (
+                            msg.get("content")
+                            or msg.get("reasoning")
+                            or msg.get("reasoning_content")
+                            or choice.get("text")
+                        )
+                        if content and str(content).strip():
+                            return str(content).strip()
+
                 err_msg = f"Groq ({model}) HTTP {resp.status_code}: {resp.text[:200]}"
                 logger.warning(err_msg)
                 errors.append(err_msg)
@@ -164,8 +194,15 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     data = resp.json()
                     choice = data.get("choices", [{}])[0]
                     msg = choice.get("message", {})
-                    content = msg.get("content") or msg.get("reasoning") or choice.get("text") or "OK"
-                    return content
+                    content = (
+                        msg.get("content")
+                        or msg.get("reasoning")
+                        or msg.get("reasoning_content")
+                        or choice.get("text")
+                    )
+                    if content and str(content).strip():
+                        return str(content).strip()
+
                 err_msg = f"OpenRouter ({model}) HTTP {resp.status_code}: {resp.text[:200]}"
                 logger.warning(err_msg)
                 errors.append(err_msg)

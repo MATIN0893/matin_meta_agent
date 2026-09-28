@@ -2,8 +2,14 @@ import os
 import re
 import difflib
 import requests
-from github import Github, GithubException
 from config.settings import GITHUB_TOKEN, GITHUB_USERNAME
+
+try:
+    from github import Github, GithubException
+except ImportError:
+    Github = None
+    class GithubException(Exception):
+        pass
 
 IGNORE_DIRS = {
     ".git", ".github", ".venv", "venv", "env", "__pycache__",
@@ -18,15 +24,11 @@ IGNORE_EXTENSIONS = {
     ".session-journal"
 }
 
-# Ограничение размера одного файла в 50 КБ, чтобы не сжигать лимиты токенов
 MAX_FILE_SIZE_BYTES = 50 * 1024
 
 
 class RepoInfo(dict):
-    """
-    Словарь с доступом к атрибутам (repo.name и repo['name']),
-    представляющий репозиторий GitHub.
-    """
+    """Словарь с доступом к атрибутам представляющий репозиторий GitHub."""
     def __init__(self, name: str, full_name: str, default_branch: str, html_url: str, private: bool = False, description: str = "", **kwargs):
         super().__init__(
             name=name,
@@ -63,17 +65,63 @@ def normalize_repo_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "", name).lower()
 
 
-def get_github_client() -> Github:
+def get_github_client():
     if not GITHUB_TOKEN:
         raise ValueError("GITHUB_TOKEN не задан в переменных окружения.")
+    if Github is None:
+        raise ImportError("Пакет PyGithub не установлен.")
     return Github(GITHUB_TOKEN)
+
+
+def check_repo_exists(repo_name: str) -> dict:
+    """
+    Проверяет реальный GitHub API endpoint: https://api.github.com/repos/{owner}/{repo}.
+    Возвращает точный статус без маскировки HTTP 404 как OK.
+    """
+    if not repo_name:
+        return {"exists": False, "status_code": 400, "message": "Имя репозитория пустое"}
+
+    owner = GITHUB_USERNAME or "MATIN0893"
+    target = repo_name.strip()
+    if "/" in target:
+        full_name = target
+    else:
+        full_name = f"{owner}/{target}"
+
+    url = f"https://api.github.com/repos/{full_name}"
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Matin-Meta-Agent"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return {"exists": True, "status_code": 200, "full_name": full_name, "message": "OK"}
+        elif resp.status_code == 404:
+            return {
+                "exists": False,
+                "status_code": 404,
+                "full_name": full_name,
+                "message": f"Репозиторий '{full_name}' не найден на GitHub (HTTP 404 Not Found)"
+            }
+        else:
+            return {
+                "exists": False,
+                "status_code": resp.status_code,
+                "full_name": full_name,
+                "message": f"GitHub API вернул статус {resp.status_code}"
+            }
+    except Exception as e:
+        return {"exists": False, "status_code": 0, "full_name": full_name, "message": str(e)}
 
 
 def get_user_repositories() -> list:
     """
     Делает GET к https://api.github.com/user/repos (или /users/{owner}/repos)
     с заголовками авторизации по GITHUB_TOKEN.
-    Возвращает список всех репозиториев аккаунта (name, full_name, default_branch, html_url).
     """
     headers = {
         "Accept": "application/vnd.github.v3+json",
@@ -85,7 +133,7 @@ def get_user_repositories() -> list:
     repos = []
     seen = set()
 
-    # 1. GET https://api.github.com/user/repos (возвращает все доступные репозитории: public и private)
+    # 1. GET https://api.github.com/user/repos
     try:
         url = "https://api.github.com/user/repos"
         params = {
@@ -115,6 +163,9 @@ def get_user_repositories() -> list:
                     url = resp.links["next"]["url"]
                 else:
                     break
+            elif resp.status_code == 404:
+                print(f"[GitHub] Запрос /user/repos вернул HTTP 404 (endpoint недоступен)")
+                break
             else:
                 break
     except Exception as e:
@@ -154,7 +205,7 @@ def get_user_repositories() -> list:
             print(f"[GitHub] Ошибка при запросе /users/{owner}/repos: {e}")
 
     # 3. Fallback на PyGithub
-    if not repos:
+    if not repos and Github is not None:
         try:
             gh = get_github_client()
             user = gh.get_user()
@@ -176,12 +227,7 @@ def get_user_repositories() -> list:
 
 
 def find_matching_repo(repo_name: str, available_repos: list = None) -> dict | None:
-    """
-    Нечеткий поиск (fuzzy search):
-    Если запрошенный репозиторий не найден напрямую по точному имени (404),
-    сравнивает имя (без учета регистра, дефисов и подчеркиваний)
-    и автоматически выбирает наиболее подходящий существующий репозиторий.
-    """
+    """Нечеткий поиск (fuzzy search) подходящего существующего репозитория."""
     if not repo_name:
         return None
 
@@ -283,7 +329,6 @@ def is_repo_list_intent(prompt: str) -> bool:
 
 
 def list_user_repos() -> list:
-    """Возвращает список имен всех репозиториев пользователя."""
     repos = get_user_repositories()
     if repos:
         return [r["name"] for r in repos]
@@ -291,72 +336,149 @@ def list_user_repos() -> list:
 
 
 def get_repo_files(repo_name: str) -> dict:
-    gh = get_github_client()
-    user = gh.get_user()
-    repo = None
+    if Github is None:
+        # Fallback на REST API
+        return _get_repo_files_rest(repo_name)
 
-    # 1. Попытка прямого получения
     try:
-        repo = user.get_repo(repo_name)
-    except Exception:
-        if GITHUB_USERNAME:
+        gh = get_github_client()
+        user = None
+        try:
+            user = gh.get_user()
+        except Exception:
+            pass
+
+        repo = None
+        target_clean = repo_name.strip()
+
+        # 1. Полноформатное имя 'owner/repo'
+        if "/" in target_clean:
             try:
-                repo = gh.get_repo(f"{GITHUB_USERNAME}/{repo_name}")
+                repo = gh.get_repo(target_clean)
             except Exception:
                 pass
 
-    # 2. Нечеткий поиск, если напрямую не найден (404)
-    if repo is None:
-        matched = find_matching_repo(repo_name)
-        if matched and matched.get("name") != repo_name:
-            actual_name = matched.get("name")
-            print(f"[GitHub] Репозиторий '{repo_name}' не найден напрямую. Найден по нечеткому совпадению: '{actual_name}'")
+        # 2. Попытка через get_user().get_repo()
+        if repo is None and user:
             try:
-                repo = user.get_repo(actual_name)
+                repo = user.get_repo(target_clean)
             except Exception:
-                if GITHUB_USERNAME:
+                pass
+
+        # 3. Попытка через GITHUB_USERNAME/{repo}
+        if repo is None:
+            owner = GITHUB_USERNAME or (user.login if user else "MATIN0893")
+            try:
+                repo = gh.get_repo(f"{owner}/{target_clean}")
+            except Exception:
+                pass
+
+        # 4. Нечеткий поиск, если напрямую не найден (404)
+        if repo is None:
+            matched = find_matching_repo(target_clean)
+            if matched and matched.get("name") != target_clean:
+                actual_name = matched.get("name")
+                print(f"[GitHub] Репозиторий '{target_clean}' не найден напрямую. Найден по нечеткому совпадению: '{actual_name}'")
+                if user:
                     try:
-                        repo = gh.get_repo(f"{GITHUB_USERNAME}/{actual_name}")
+                        repo = user.get_repo(actual_name)
+                    except Exception:
+                        pass
+                if repo is None:
+                    owner = GITHUB_USERNAME or (user.login if user else "MATIN0893")
+                    try:
+                        repo = gh.get_repo(f"{owner}/{actual_name}")
                     except Exception:
                         pass
 
-    if repo is None:
-        return {}
+        if repo is None:
+            check = check_repo_exists(target_clean)
+            print(f"[GitHub] Ошибка обращения к '{target_clean}': {check.get('message')}")
+            return {}
+
+        files_dict = {}
+
+        def fetch_recursive(path=""):
+            try:
+                contents = repo.get_contents(path)
+            except Exception:
+                return
+
+            if not isinstance(contents, list):
+                contents = [contents]
+
+            for item in contents:
+                if item.type == "dir":
+                    if item.name.lower() in IGNORE_DIRS:
+                        continue
+                    fetch_recursive(item.path)
+                elif item.type == "file":
+                    name_lower = item.name.lower()
+                    _, ext = os.path.splitext(name_lower)
+
+                    if name_lower in ("poetry.lock", "package-lock.json", "yarn.lock"):
+                        continue
+                    if ext in IGNORE_EXTENSIONS:
+                        continue
+                    if item.size > MAX_FILE_SIZE_BYTES:
+                        continue
+
+                    try:
+                        content_str = item.decoded_content.decode("utf-8", errors="ignore")
+                        files_dict[item.path] = content_str
+                    except Exception:
+                        pass
+
+        fetch_recursive()
+        return files_dict
+
+    except Exception as e:
+        print(f"[GitHub] Ошибка get_repo_files: {e}")
+        return _get_repo_files_rest(repo_name)
+
+
+def _get_repo_files_rest(repo_name: str) -> dict:
+    """Fallback скачивания файлов через REST API GitHub."""
+    owner = GITHUB_USERNAME or "MATIN0893"
+    target = repo_name.strip()
+    full_name = target if "/" in target else f"{owner}/{target}"
+
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Matin-Meta-Agent"
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
     files_dict = {}
 
-    def fetch_recursive(path=""):
+    def fetch_dir(path=""):
+        url = f"https://api.github.com/repos/{full_name}/contents/{path}".rstrip("/")
         try:
-            contents = repo.get_contents(path)
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                return
+            items = resp.json()
+            if not isinstance(items, list):
+                items = [items]
+            for item in items:
+                itype = item.get("type")
+                ipath = item.get("path", "")
+                iname = item.get("name", "")
+                if itype == "dir":
+                    if iname.lower() in IGNORE_DIRS:
+                        continue
+                    fetch_dir(ipath)
+                elif itype == "file":
+                    download_url = item.get("download_url")
+                    if download_url:
+                        fresp = requests.get(download_url, timeout=10)
+                        if fresp.status_code == 200:
+                            files_dict[ipath] = fresp.text
         except Exception:
-            return
+            pass
 
-        if not isinstance(contents, list):
-            contents = [contents]
-
-        for item in contents:
-            if item.type == "dir":
-                if item.name.lower() in IGNORE_DIRS:
-                    continue
-                fetch_recursive(item.path)
-            elif item.type == "file":
-                name_lower = item.name.lower()
-                _, ext = os.path.splitext(name_lower)
-
-                if name_lower in ("poetry.lock", "package-lock.json", "yarn.lock"):
-                    continue
-                if ext in IGNORE_EXTENSIONS:
-                    continue
-                if item.size > MAX_FILE_SIZE_BYTES:
-                    continue
-
-                try:
-                    content_str = item.decoded_content.decode("utf-8", errors="ignore")
-                    files_dict[item.path] = content_str
-                except Exception:
-                    pass
-
-    fetch_recursive()
+    fetch_dir()
     return files_dict
 
 
@@ -364,7 +486,6 @@ def push_project(repo_name: str, files: dict, commit_message: str = "Production 
     gh = get_github_client()
     user = gh.get_user()
 
-    # Нечеткий поиск существующего репозитория во избежание дублирования
     target_name = repo_name
     matched = find_matching_repo(repo_name)
     if matched and matched.get("name"):
