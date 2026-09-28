@@ -24,6 +24,12 @@ from services.github_service import (
 )
 
 try:
+    from services.patrol_service import record_brain_success
+except ImportError:
+    def record_brain_success():
+        pass
+
+try:
     from json_repair import repair_json
 except ImportError:
     repair_json = None
@@ -218,6 +224,8 @@ async def run_task(prompt: str, status_cb=None) -> str:
     if not plan:
         return "❌ Ошибка разбора плана: модель вернула некорректный ответ."
 
+    record_brain_success()
+
     action = get_field(plan, "action", default="modify")
     project_name = get_field(plan, "project_name", default="matin-agent")
     target_file = get_field(plan, "target_file", default="")
@@ -290,6 +298,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
             target_path = get_field(mod_data, "file_path") or target_file
             if target_path:
                 files[target_path] = clean_code_snippet(mod_data["code"])
+        record_brain_success()
 
     # Сценарий: Создание нового проекта (ENGINEER)
     else:
@@ -312,6 +321,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
             target_path = get_field(eng_data, "file_path") or target_file
             if target_path:
                 files[target_path] = clean_code_snippet(eng_data["code"])
+        record_brain_success()
 
     if not files:
         return "⚠️ Не удалось получить файлы для сохранения."

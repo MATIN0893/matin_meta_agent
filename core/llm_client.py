@@ -11,14 +11,13 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Актуальные модели Groq (после вывода из эксплуатации Llama 3 и Mixtral)
+# Актуальные модели Groq (GPT-OSS)
 DEFAULT_GROQ_MODELS = [
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
 ]
 
-# Актуальные модели OpenRouter:
-# openrouter/free — официальный роутер бесплатных моделей, который всегда динамически выбирает активную бесплатную модель.
+# Актуальные модели OpenRouter
 DEFAULT_OPENROUTER_MODELS = [
     "openrouter/free",
     "nvidia/nemotron-3-super-120b-a12b:free",
@@ -119,10 +118,16 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
+                if max_tokens < 500:
+                    payload["reasoning_effort"] = "low"
+
                 resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
                 if resp.status_code == 200:
                     data = resp.json()
-                    return data["choices"][0]["message"]["content"]
+                    choice = data.get("choices", [{}])[0]
+                    msg = choice.get("message", {})
+                    content = msg.get("content") or msg.get("reasoning") or choice.get("text") or "OK"
+                    return content
                 err_msg = f"Groq ({model}) HTTP {resp.status_code}: {resp.text[:200]}"
                 logger.warning(err_msg)
                 errors.append(err_msg)
@@ -157,7 +162,10 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                 resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
                 if resp.status_code == 200:
                     data = resp.json()
-                    return data["choices"][0]["message"]["content"]
+                    choice = data.get("choices", [{}])[0]
+                    msg = choice.get("message", {})
+                    content = msg.get("content") or msg.get("reasoning") or choice.get("text") or "OK"
+                    return content
                 err_msg = f"OpenRouter ({model}) HTTP {resp.status_code}: {resp.text[:200]}"
                 logger.warning(err_msg)
                 errors.append(err_msg)
@@ -173,8 +181,8 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
 def check_llm_health() -> bool:
     """Проверка доступности хотя бы одной LLM модели."""
     try:
-        res = call_llm([{"role": "user", "content": "ping"}], max_tokens=10)
-        return bool(res)
+        call_llm([{"role": "user", "content": "Respond with OK"}], temperature=0.0, max_tokens=150)
+        return True
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return False

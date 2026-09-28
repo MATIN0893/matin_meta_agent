@@ -1,3 +1,4 @@
+import asyncio
 import os
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -33,7 +34,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Доступ ограничен.")
         return
 
-    brain_ok = check_self_brain()
+    brain_ok = await asyncio.to_thread(check_self_brain)
     brain_status = "🟢 В норме (LLM Router активен)" if brain_ok else "🔴 Ошибка связи с LLM"
 
     try:
