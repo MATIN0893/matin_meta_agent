@@ -1,6 +1,7 @@
 import asyncio
 import os
 import json
+import time
 from telegram import Update
 from telegram.ext import ContextTypes
 from config.settings import is_user_allowed
@@ -12,6 +13,7 @@ from services.patrol_service import STATE, check_self_brain, ServiceState
 from services.health_service import PATROL_STATS, get_full_health_report
 from services.render_service import get_services
 from engine.agent_registry import agent_registry
+from core.task_engine import task_engine, TaskState
 
 
 def is_allowed(user_id: int) -> bool:
@@ -35,6 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🔒 **Security Guard:** защита от деструктивных действий и утечек токенов\n\n"
         "📌 **Основные команды:**\n"
         "• /status — Полный рапорт здоровья системы и сервисов\n"
+        "• /stop — Немедленно остановить текущую выполняющуюся задачу\n"
         "• /agents — Список созданных AI-агентов в реестре\n"
         "• /repos — Список репозиториев на GitHub\n"
         "• /help — Инструкция по управлению на естественном языке"
@@ -47,6 +50,22 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(user_id):
         await update.message.reply_text("⛔ Доступ ограничен.")
         return
+
+    active_block = ""
+    active = task_engine.get_active_task()
+    if active:
+        elapsed = int(time.time() - active.created_at)
+        active_block = (
+            "⚙️ **ТЕКУЩАЯ ЗАДАЧА В ПРОЦЕССЕ ВЫПОЛНЕНИЯ:**\n"
+            f"• **ID:** `{active.task_id}`\n"
+            f"• **Состояние:** `{active.state.value}`\n"
+            f"• **Стадия:** {active.current_stage or 'Выполняется...'}\n"
+            f"• **Репозиторий:** `{active.target_repo or '—'}` (`{active.target_branch}`)\n"
+            f"• **Время работы:** `{elapsed} сек`\n"
+            f"• **Команда:** _{active.command}_\n"
+            "💡 _Отправь `СТОП` или `/stop` для отмены_\n\n"
+            "────────────────────────────────────────\n"
+        )
 
     brain_ok = await asyncio.to_thread(check_self_brain)
     brain_status = "🟢 В норме (LLM Router активен)" if brain_ok else "🔴 Ошибка связи с LLM"
@@ -81,6 +100,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agents_count = len(agent_registry.list_agents())
 
     status_msg = (
+        f"{active_block}"
         "🛡 **SRE CONTROL PLANE: СТАТУС**\n\n"
         f"• 🧠 **Мозг агента:** {brain_status}\n"
         f"• ⏱ **SRE Patrol:** {patrol_status} (циклов: {patrol_runs})\n"
@@ -92,6 +112,30 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 _Автопатруль и Self-Heal активны в фоновом режиме_"
     )
     await update.message.reply_text(status_msg, parse_mode="Markdown")
+
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ Доступ ограничен.")
+        return
+
+    active = task_engine.get_active_task()
+    if active:
+        cancelled = task_engine.cancel_current_task(reason="Остановлено по команде /stop")
+        cid = cancelled.task_id if cancelled else active.task_id
+        cmd = cancelled.command if cancelled else active.command
+        resp = (
+            "🛑 **Текущая задача успешно остановлена**\n\n"
+            f"• **ID:** `{cid}`\n"
+            f"• **Команда:** _{cmd}_\n"
+            "• **Состояние:** `CANCELLED`\n"
+            "• **Task Lock:** Освобожден ✅\n\n"
+            "Система разблокирована и готова к приему новых команд."
+        )
+        await update.message.reply_text(resp, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("ℹ️ В данный момент нет активных выполняющихся задач.", parse_mode="Markdown")
 
 
 async def repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -150,6 +194,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 **Справка по управлению MATIN META:**\n\n"
         "Ты можешь отправлять любые инженерные задачи обычным текстом:\n\n"
+        "• **Управление активной задачей:**\n"
+        "  `СТАТУС` или `STATUS CHECK` — узнать, на какой стадии находится текущая задача\n"
+        "  `СТОП` или `STOP CURRENT TASK` — немедленно прервать текущую задачу\n\n"
         "• **Создание агентов:**\n"
         "  `Создай агента MATIN MONITOR`\n"
         "  `Создай агента для мониторинга Telegram-ботов`\n\n"
@@ -160,12 +207,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• **Инфраструктура и проекты:**\n"
         "  `Список репозиториев`\n"
         "  `Проверь matin-agent`\n"
-        "  `Проверь Render`\n"
-        "  `Исправь ошибку в main.py репозитория X`\n"
+        "  `Найди источник ошибки 429 в MATIN0893/matin-agent`\n"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
+cancel_cmd = stop_cmd
 repos_cmd = repos
 status_cmd = status
 start_cmd = start

@@ -16,7 +16,7 @@ logger = logging.getLogger("MATIN.META")
 
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
 
-from bot.handlers.commands import start, repos, status, agents_cmd, help_cmd
+from bot.handlers.commands import start, repos, status, agents_cmd, help_cmd, stop_cmd, cancel_cmd
 from bot.handlers.build_task import handle_message
 from services.health_service import run_health_server
 from services.patrol_supervisor import start_supervised_patrol
@@ -53,6 +53,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("repos", repos))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("agents", agents_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
 

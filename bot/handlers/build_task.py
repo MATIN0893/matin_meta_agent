@@ -1,8 +1,11 @@
 import asyncio
+import os
 import re
+import time
 from config.settings import is_user_allowed
 from core.orchestrator import run_task
 from core.security import security_guard
+from core.task_engine import task_engine, TaskState
 from engine.agent_factory import agent_factory
 from engine.agent_registry import agent_registry
 from services.github_service import (
@@ -19,6 +22,16 @@ except ImportError:
         pass
     class ContextTypes:
         DEFAULT_TYPE = None
+
+
+def is_stop_intent(text: str) -> bool:
+    t = text.strip().lower()
+    return bool(re.search(r"^(?:stop|стоп|останови|остановить|прерви|прервать|cancel|отмена|отмени|stop\s+current\s+task|halt|kill)$", t, re.I))
+
+
+def is_status_intent(text: str) -> bool:
+    t = text.strip().lower()
+    return bool(re.search(r"^(?:status|статус|status\s+check|проверь\s+статус|состояние|текущий\s+статус|state)$", t, re.I))
 
 
 def is_agent_list_intent(text: str) -> bool:
@@ -54,7 +67,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.edit_text(f"❌ Агент `{target}` не найден в реестре.")
         return
 
-    # 2. Интент списка агентов
+    # 2. Перехват CONTROL-КОМАНДЫ: STOP / STOP CURRENT TASK / CANCEL
+    if is_stop_intent(text):
+        active = task_engine.get_active_task()
+        if active:
+            cancelled = task_engine.cancel_current_task(reason="Остановлено по команде пользователя")
+            cid = cancelled.task_id if cancelled else active.task_id
+            cmd = cancelled.command if cancelled else active.command
+            resp = (
+                "🛑 **Текущая задача остановлена**\n\n"
+                f"• **ID:** `{cid}`\n"
+                f"• **Команда:** _{cmd}_\n"
+                "• **Состояние:** `CANCELLED`\n"
+                "• **Task Lock:** Освобожден ✅\n\n"
+                "Система разблокирована и готова к приему новых команд."
+            )
+            await update.message.reply_text(resp, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("ℹ️ В данный момент нет активных выполняющихся задач.", parse_mode="Markdown")
+        return
+
+    # 3. Перехват CONTROL-КОМАНДЫ: STATUS / STATUS CHECK
+    if is_status_intent(text):
+        active = task_engine.get_active_task()
+        if active:
+            elapsed = int(time.time() - active.created_at)
+            stage = active.current_stage or "Выполняется..."
+            repo_info = f"`{active.target_repo}` ({active.target_branch})" if active.target_repo else "не определен"
+            resp = (
+                "⚙️ **ТЕКУЩАЯ ЗАДАЧА В ПРОЦЕССЕ ВЫПОЛНЕНИЯ**\n\n"
+                f"• **ID задачи:** `{active.task_id}`\n"
+                f"• **Состояние:** `{active.state.value}`\n"
+                f"• **Текущая стадия:** {stage}\n"
+                f"• **Целевой репозиторий:** {repo_info}\n"
+                f"• **Время работы:** `{elapsed} сек`\n"
+                f"• **Команда:** _{active.command}_\n\n"
+                "💡 _Чтобы остановить задачу, отправь `СТОП` или `/stop`._"
+            )
+            await update.message.reply_text(resp, parse_mode="Markdown")
+        else:
+            from bot.handlers.commands import status as status_cmd
+            await status_cmd(update, context)
+        return
+
+    # 4. Интент списка агентов
     if is_agent_list_intent(text):
         agents = agent_registry.list_agents()
         if not agents:
@@ -67,7 +123,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
-    # 3. Интент создания нового агента (Agent Factory)
+    # 5. Интент создания нового агента (Agent Factory)
     if is_create_agent_intent(text):
         msg = await update.message.reply_text("🏭 **Agent Factory запущена**\nАнализирую требования к агенту...")
 
@@ -80,12 +136,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             res = await asyncio.to_thread(agent_factory.create_agent, text, factory_cb)
             if res.get("success"):
+                perms_list = res.get('permissions', [])
+                perms_str = ', '.join(perms_list) if perms_list else 'standard'
                 report = (
                     f"✅ **Агент успешно создан!**\n\n"
                     f"• **Имя:** {res.get('name')}\n"
                     f"• **ID:** `{res.get('agent_id')}`\n"
                     f"• **Файлов сгенерировано:** {res.get('files_count')}\n"
-                    f"• **Разрешения:** `{', '.join(res.get('permissions', []))}`\n"
+                    f"• **Разрешения:** `{perms_str}`\n"
                     f"• **Статус:** `READY` (все тесты успешно пройдены)\n\n"
                     f"Агент добавлен в реестр и готов к работе."
                 )
@@ -96,8 +154,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Фатальный сбой Agent Factory: {e}")
         return
 
-    # 4. Интент удаления агента (Security Guard с подтверждением)
-    del_match = re.search(r"^(?:удали|удалить)\s+агента(?:\s*:)?\s*[`'\"«]?([^`'\"»\n]+?)[`'\"»]?$", text, re.I)
+    # 6. Интент удаления агента (Security Guard с подтверждением)
+    del_match = re.search(r"^(?:удали|удалить)\s+агента(?:\\s*:)?\s*([a-zA-Z0-9_\-]+)$", text, re.I)
     if del_match:
         target_agent = del_match.group(1).strip()
         existing = agent_registry.find_agent(target_agent)
@@ -113,7 +171,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(warn_msg, parse_mode="Markdown")
         return
 
-    # 5. Интент списка репозиториев
+    # 7. Интент списка репозиториев
     if is_repo_list_intent(text):
         msg = await update.message.reply_text("🔍 Запрашиваю список репозиториев с GitHub...")
         try:
@@ -124,7 +182,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Ошибка при получении репозиториев: {e}")
         return
 
-    # 6. Общая инженерная задача
+    # 8. ПРОВЕРКА TASK LOCK: если задача уже выполняется, блокируем запуск второй
+    if task_engine.is_locked():
+        active = task_engine.get_active_task()
+        active_id = active.task_id if active else "unknown"
+        active_cmd = active.command if active else "задача"
+        stage = active.current_stage if active else "выполняется"
+        await update.message.reply_text(
+            f"⚠️ **Внимание: уже выполняется задача!**\n\n"
+            f"• **ID задачи:** `{active_id}`\n"
+            f"• **Текущая стадия:** {stage}\n"
+            f"• **Команда:** _{active_cmd}_\n\n"
+            f"Пожалуйста, дождитесь ее завершения или отправьте `СТОП` для отмены.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # 9. Запуск общей инженерной задачи с общим task timeout и поддержкой cancellation
     msg = await update.message.reply_text("⚙️ Принял задачу, начинаю...")
 
     async def progress(step: str):
@@ -133,8 +207,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    TASK_TIMEOUT = float(os.getenv("MATIN_TASK_TIMEOUT", "180.0"))
+    task_coro = run_task(text, progress)
+    running_async_task = asyncio.create_task(task_coro)
+
+    active = task_engine.get_active_task()
+    if active:
+        task_engine.acquire_lock(active, running_async_task)
+
     try:
-        result = await run_task(text, progress)
+        result = await asyncio.wait_for(running_async_task, timeout=TASK_TIMEOUT)
+    except asyncio.CancelledError:
+        result = "🛑 Задача была прервана пользователем."
+    except asyncio.TimeoutError:
+        task_engine.cancel_current_task(reason=f"Превышен общий таймаут ({TASK_TIMEOUT}s)")
+        result = f"⏱ **Превышен общий таймаут выполнения задачи ({TASK_TIMEOUT} сек).** Задача остановлена."
     except Exception as e:
         result = f"❌ Сбой выполнения задачи: {e}"
 

@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+DEFAULT_LLM_TIMEOUT = float(os.getenv("MATIN_LLM_TIMEOUT", "45.0"))
+DEFAULT_PER_MODEL_TIMEOUT = float(os.getenv("MATIN_PER_MODEL_TIMEOUT", "15.0"))
+
 # Актуальные рабочие модели Groq
 DEFAULT_GROQ_MODELS = [
     "openai/gpt-oss-120b",
@@ -65,7 +68,7 @@ def fetch_available_groq_models(groq_key: str) -> list:
         resp = requests.get(
             "https://api.groq.com/openai/v1/models",
             headers={"Authorization": f"Bearer {groq_key}"},
-            timeout=10,
+            timeout=5,
         )
         if resp.status_code == 200:
             data = resp.json().get("data", [])
@@ -86,11 +89,19 @@ def fetch_available_groq_models(groq_key: str) -> list:
     return DEFAULT_GROQ_MODELS
 
 
-def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -> str:
+def call_llm(
+    messages: list,
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout: float = DEFAULT_LLM_TIMEOUT
+) -> str:
     """
-    Вызывает доступную LLM модель с каскадным переключением (Groq -> OpenRouter).
-    Автоматически перебирает актуальные рабочие модели.
+    Вызывает доступную LLM модель с каскадным переключением (Groq -> OpenRouter)
+    и строгим контролем общего таймаута (overall deadline).
     """
+    start_time = time.time()
+    deadline = start_time + timeout
+
     groq_key = _get_env("GROQ_API_KEY")
     openrouter_key = _get_env("OPENROUTER_API_KEY")
 
@@ -100,7 +111,7 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
     errors = []
 
     # 1. Попытка вызвать Groq (быстрый и стабильный)
-    if groq_key:
+    if groq_key and (deadline - time.time() > 1.0):
         headers = {
             "Authorization": f"Bearer {groq_key}",
             "Content-Type": "application/json",
@@ -116,7 +127,13 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
             if m not in groq_models and m not in DEPRECATED_MODELS:
                 groq_models.append(m)
 
-        for model in groq_models:
+        for model in groq_models[:3]:
+            remaining = deadline - time.time()
+            if remaining <= 1.0:
+                errors.append(f"Превышен лимит времени на Groq ({timeout}s)")
+                break
+
+            req_timeout = max(1.0, min(DEFAULT_PER_MODEL_TIMEOUT, remaining))
             try:
                 payload = {
                     "model": model,
@@ -124,11 +141,10 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
-                # Безопасно передаем reasoning_effort только для поддерживаемых моделей
                 if any(r in model.lower() for r in ["gpt-oss", "o1", "o3", "reasoner"]) and max_tokens < 500:
                     payload["reasoning_effort"] = "low"
 
-                resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+                resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=req_timeout)
                 if resp.status_code == 200:
                     data = resp.json()
                     choice = data.get("choices", [{}])[0]
@@ -142,9 +158,8 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     if content and str(content).strip():
                         return str(content).strip()
                 elif resp.status_code == 400 and "reasoning_effort" in payload:
-                    # Повторная попытка без reasoning_effort в случае 400
                     del payload["reasoning_effort"]
-                    retry_resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+                    retry_resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=req_timeout)
                     if retry_resp.status_code == 200:
                         data = retry_resp.json()
                         choice = data.get("choices", [{}])[0]
@@ -158,7 +173,7 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                         if content and str(content).strip():
                             return str(content).strip()
 
-                err_msg = f"Groq ({model}) HTTP {resp.status_code}: {resp.text[:200]}"
+                err_msg = f"Groq ({model}) HTTP {resp.status_code}: {resp.text[:120]}"
                 logger.warning(err_msg)
                 errors.append(err_msg)
             except Exception as e:
@@ -167,7 +182,7 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                 errors.append(err_msg)
 
     # 2. Попытка вызвать OpenRouter (запасной или основной)
-    if openrouter_key:
+    if openrouter_key and (deadline - time.time() > 1.0):
         headers = {
             "Authorization": f"Bearer {openrouter_key}",
             "Content-Type": "application/json",
@@ -181,7 +196,13 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
             if m not in openrouter_models and m not in DEPRECATED_MODELS:
                 openrouter_models.append(m)
 
-        for model in openrouter_models:
+        for model in openrouter_models[:3]:
+            remaining = deadline - time.time()
+            if remaining <= 1.0:
+                errors.append(f"Превышен лимит времени на OpenRouter ({timeout}s)")
+                break
+
+            req_timeout = max(1.0, min(DEFAULT_PER_MODEL_TIMEOUT, remaining))
             try:
                 payload = {
                     "model": model,
@@ -189,7 +210,7 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
-                resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
+                resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=req_timeout)
                 if resp.status_code == 200:
                     data = resp.json()
                     choice = data.get("choices", [{}])[0]
@@ -203,7 +224,7 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                     if content and str(content).strip():
                         return str(content).strip()
 
-                err_msg = f"OpenRouter ({model}) HTTP {resp.status_code}: {resp.text[:200]}"
+                err_msg = f"OpenRouter ({model}) HTTP {resp.status_code}: {resp.text[:120]}"
                 logger.warning(err_msg)
                 errors.append(err_msg)
             except Exception as e:
@@ -211,14 +232,17 @@ def call_llm(messages: list, temperature: float = 0.2, max_tokens: int = 4096) -
                 logger.warning(err_msg)
                 errors.append(err_msg)
 
+    elapsed = time.time() - start_time
     err_summary = "; ".join(errors) if errors else "API-ключи GROQ_API_KEY и OPENROUTER_API_KEY не заданы"
+    if elapsed >= timeout:
+        raise TimeoutError(f"Превышен общий таймаут обращения к LLM ({timeout:.1f}s). Причины: {err_summary}")
     raise RuntimeError(f"Все LLM провайдеры недоступны. Причины: {err_summary}")
 
 
 def check_llm_health() -> bool:
     """Проверка доступности хотя бы одной LLM модели."""
     try:
-        call_llm([{"role": "user", "content": "Respond with OK"}], temperature=0.0, max_tokens=150)
+        call_llm([{"role": "user", "content": "Respond with OK"}], temperature=0.0, max_tokens=150, timeout=10.0)
         return True
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -233,13 +257,10 @@ def ask(
     system_prompt: str = "",
     temperature: float = 0.2,
     max_tokens: int = 4096,
+    timeout: float = DEFAULT_LLM_TIMEOUT,
 ) -> str:
     """
-    Универсальная точка входа для запросов к LLM.
-    Корректно обрабатывает:
-    - ask(system_prompt, user_prompt) — позиционные аргументы orchestrator
-    - ask(user_prompt) — одиночный запрос
-    - ask(prompt=..., system_prompt=...) — именованные аргументы
+    Универсальная точка входа для запросов к LLM с поддержкой timeout.
     """
     if prompt and system_prompt:
         sys_content = system_prompt
@@ -265,4 +286,4 @@ def ask(
     elif not messages:
         messages.append({"role": "user", "content": "ping"})
 
-    return call_llm(messages, temperature=temperature, max_tokens=max_tokens)
+    return call_llm(messages, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
