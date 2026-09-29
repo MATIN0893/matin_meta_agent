@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-DEFAULT_LLM_TIMEOUT = float(os.getenv("MATIN_LLM_TIMEOUT", "45.0"))
-DEFAULT_PER_MODEL_TIMEOUT = float(os.getenv("MATIN_PER_MODEL_TIMEOUT", "15.0"))
+DEFAULT_LLM_TIMEOUT = float(os.getenv("MATIN_LLM_TIMEOUT", "35.0"))
+DEFAULT_PER_MODEL_TIMEOUT = float(os.getenv("MATIN_PER_MODEL_TIMEOUT", "12.0"))
 
 # Актуальные рабочие модели Groq
 DEFAULT_GROQ_MODELS = [

@@ -47,6 +47,35 @@ from engine.agent_registry import agent_registry, AgentLifecycle
 
 logger = logging.getLogger("MATIN.ORCHESTRATOR")
 
+def log_task_incident(task, reason: str, timeout: float = None, llm_model: str = ""):
+    if not task:
+        return
+    import datetime
+    start_iso = datetime.datetime.fromtimestamp(task.created_at, datetime.timezone.utc).isoformat()
+    elapsed = round(time.time() - task.created_at, 2)
+    actions = getattr(task, "actions", [])
+    last_action = actions[-1] if actions else {}
+    last_event = f"{last_action.get('action', 'none')} ({last_action.get('status', '')}): {last_action.get('details', '')}"
+
+    raw_log = f"""
+==================== [TASK INCIDENT REPORT] ====================
+• TASK_ID:       {task.task_id}
+• USER_ID:       {getattr(task, 'user_id', 0)}
+• TARGET_REPO:   {task.target_repo or 'N/A'} ({task.target_branch})
+• TASK_TYPE:     {task.task_type or 'UNKNOWN'}
+• CURRENT_STAGE: {task.current_stage or 'N/A'}
+• START_TIME:    {start_iso} (elapsed: {elapsed}s)
+• LLM_MODEL:     {llm_model or os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')}
+• TIMEOUT:       {timeout or os.getenv('MATIN_ANALYZE_TIMEOUT', 45.0)}s
+• LAST_EVENT:    {last_event}
+• TASK_STATE:    {task.state.value if hasattr(task.state, 'value') else task.state}
+• LOCK_STATE:    {'LOCKED' if task_engine.is_locked() else 'RELEASED'}
+• REASON:        {reason}
+================================================================="""
+    clean_log = security_guard.sanitize_secrets(raw_log)
+    logger.warning(clean_log)
+
+
 try:
     from services.patrol_service import record_brain_success
 except ImportError:
@@ -365,8 +394,8 @@ def classify_task_intent(prompt: str, plan_data: dict = None) -> str:
     return "CODE_MODIFICATION"
 
 
-async def run_task(prompt: str, status_cb=None) -> str:
-    task = task_engine.create_task(user_id=0, command=prompt)
+async def run_task(prompt: str, status_cb=None, existing_task=None) -> str:
+    task = existing_task if existing_task else task_engine.create_task(user_id=0, command=prompt)
 
     # Acquire lock for this task
     current_async = None
@@ -629,18 +658,28 @@ async def run_task(prompt: str, status_cb=None) -> str:
                 "6. 🔒 Статус: READ-ONLY (изменения в кодовую базу не вносились)."
             )
 
-            ANALYZE_TIMEOUT = float(os.getenv("MATIN_ANALYZE_TIMEOUT", "45.0"))
+            ANALYZE_TIMEOUT = float(os.getenv("MATIN_ANALYZE_TIMEOUT", "35.0"))
             try:
-                ai_report = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        ask,
+                sig = inspect.signature(ask)
+                if "timeout" in sig.parameters:
+                    call_func = lambda: ask(
                         "Ты элитный SRE инженер MATIN META. Отвечай строго профессионально, опираясь только на реальный код репозитория.",
                         diagnostic_prompt,
-                    ),
+                        timeout=min(ANALYZE_TIMEOUT, 30.0)
+                    )
+                else:
+                    call_func = lambda: ask(
+                        "Ты элитный SRE инженер MATIN META. Отвечай строго профессионально, опираясь только на реальный код репозитория.",
+                        diagnostic_prompt
+                    )
+
+                ai_report = await asyncio.wait_for(
+                    asyncio.to_thread(call_func),
                     timeout=ANALYZE_TIMEOUT
                 )
             except (asyncio.TimeoutError, TimeoutError) as te:
                 logger.warning(f"Таймаут стадии ANALYZE ({ANALYZE_TIMEOUT}s): {te}. Формирую детерминированный отчет.")
+                log_task_incident(task, reason=f"Таймаут стадии ANALYZE ({ANALYZE_TIMEOUT}s)", timeout=ANALYZE_TIMEOUT)
                 ai_report = (
                     f"⚠️ **Таймаут стадии глубокого LLM анализа ({ANALYZE_TIMEOUT}s).**\n"
                     "Заключение сформировано на основе детерминированного сканирования кодовой базы:\n\n"
@@ -659,6 +698,7 @@ async def run_task(prompt: str, status_cb=None) -> str:
                 )
             except Exception as e:
                 logger.warning(f"Ошибка вызова LLM в стадии ANALYZE: {e}")
+                log_task_incident(task, reason=f"Сбой вызова LLM в стадии ANALYZE: {e}", timeout=ANALYZE_TIMEOUT)
                 ai_report = (
                     f"⚠️ **Сбой вызова LLM ({e}).**\n"
                     "Заключение сформировано на основе детерминированного сканирования кодовой базы:\n\n"
@@ -688,7 +728,6 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
         # =============================================================
         # PIPELINE: REPOSITORY_INSPECTION
-        # Показать структуру/метаданные репозитория или файл БЕЗ изменений
         # =============================================================
         if task_type == "REPOSITORY_INSPECTION":
             task_engine.update_state(task.task_id, TaskState.EXECUTING, current_stage="INSPECTION")
@@ -792,7 +831,6 @@ async def run_task(prompt: str, status_cb=None) -> str:
 
         # =============================================================
         # PIPELINE: CODE_MODIFICATION / PROJECT_GENERATION
-        # Изменение кодовой базы с ревью и деплоем
         # =============================================================
         files = {}
         task_engine.update_state(task.task_id, TaskState.EXECUTING, current_stage="CODE_GENERATION")
@@ -887,7 +925,6 @@ async def run_task(prompt: str, status_cb=None) -> str:
             )
             record_brain_success()
 
-        # ЗАЩИТА: Ошибка "Не удалось получить файлы" только для реальной генерации/модификации кода!
         if not files:
             if task_type in ("CODE_MODIFICATION", "PROJECT_GENERATION") and action in ("modify", "create"):
                 res = "⚠️ Не удалось получить файлы для сохранения."
@@ -966,14 +1003,17 @@ async def run_task(prompt: str, status_cb=None) -> str:
     except asyncio.CancelledError:
         cancel_msg = f"🛑 **Задача `{task.task_id}` отменена пользователем.**\n• Команда: _{prompt}_"
         task_engine.update_state(task.task_id, TaskState.CANCELLED, error="Отменено пользователем", result=cancel_msg)
+        log_task_incident(task, reason="Отменено пользователем (CancelledError)")
         return cancel_msg
     except (asyncio.TimeoutError, TimeoutError) as te:
         timeout_msg = f"⏱ **Превышен общий таймаут выполнения задачи `{task.task_id}`.**"
         task_engine.update_state(task.task_id, TaskState.TIMEOUT, error=str(te), result=timeout_msg)
+        log_task_incident(task, reason=f"Превышен общий таймаут ({te})")
         return timeout_msg
     except Exception as e:
         err_msg = f"❌ Сбой выполнения задачи: {e}"
         task_engine.update_state(task.task_id, TaskState.FAILED, error=str(e), result=err_msg)
+        log_task_incident(task, reason=f"Сбой выполнения задачи: {e}")
         return err_msg
     finally:
         task_engine.release_lock(task.task_id)

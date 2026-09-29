@@ -70,7 +70,7 @@ def main():
     logger.info("🤖 MATIN META Engineering OS запущена (SRE Patrol активен 24/7)")
     print("🤖 Meta Agent запущен (SRE Patrol активен)")
 
-    app.run_polling(timeout=30)
+    app.run_polling(timeout=30, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

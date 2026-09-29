@@ -87,7 +87,6 @@ class TestResilienceAndControl(unittest.TestCase):
         task_engine.set_last_target_repo("MATIN0893/matin-agent", "main")
         self.assertEqual(task_engine.get_last_target_repo(), "MATIN0893/matin-agent")
 
-        # Если команда не содержит имени репозитория, берется последний активный
         with patch("core.orchestrator.ask") as mock_ask, \
              patch("services.github_service.get_repo_metadata") as mock_meta, \
              patch("services.github_service.get_repo_tree") as mock_tree, \
@@ -96,7 +95,7 @@ class TestResilienceAndControl(unittest.TestCase):
             mock_ask.return_value = json.dumps({
                 "action": "diagnostic",
                 "task_type": "CODE_DIAGNOSTIC",
-                "project_name": "", # пустое имя
+                "project_name": "",
                 "target_file": "",
                 "task_description": "подготовить план resilience",
                 "env": {}

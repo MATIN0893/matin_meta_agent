@@ -2,8 +2,6 @@ import asyncio
 import os
 import json
 import time
-from telegram import Update
-from telegram.ext import ContextTypes
 from config.settings import is_user_allowed
 from services.github_service import (
     get_user_repositories,
@@ -14,6 +12,15 @@ from services.health_service import PATROL_STATS, get_full_health_report
 from services.render_service import get_services
 from engine.agent_registry import agent_registry
 from core.task_engine import task_engine, TaskState
+
+try:
+    from telegram import Update
+    from telegram.ext import ContextTypes
+except ImportError:
+    class Update:
+        pass
+    class ContextTypes:
+        DEFAULT_TYPE = None
 
 
 def is_allowed(user_id: int) -> bool:
@@ -71,7 +78,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     brain_status = "🟢 В норме (LLM Router активен)" if brain_ok else "🔴 Ошибка связи с LLM"
 
     try:
-        render_list = get_services()
+        render_list = await asyncio.to_thread(get_services)
     except Exception:
         render_list = []
 
@@ -106,7 +113,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• ⏱ **SRE Patrol:** {patrol_status} (циклов: {patrol_runs})\n"
         f"• ☁️ **Облако 24/7:** Независим от ПК (Render Web)\n"
         f"• 🏭 **Зарегистрировано агентов:** {agents_count}\n"
-        f"• 📡 **Сервисов под надзором Render:** {len(render_list)}\n\n"
+        f"• 📡 **Сервисов под надзором Render:** {len(render_list)}\\n\\n"
         "**Инфраструктура:**\n"
         f"{services_block}\n\n"
         "🚀 _Автопатруль и Self-Heal активны в фоновом режиме_"
